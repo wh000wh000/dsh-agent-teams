@@ -91,6 +91,13 @@ export interface JevDecisionConfig {
     routing: boolean
     dedup: boolean
     /**
+     * Let the layer choose WHICH completed dependency outputs the prompt
+     * budget spends itself on. Default OFF: on the only real corpus available
+     * it judged every dependency needed and therefore changed nothing, so it
+     * costs one request per over-budget dispatch with no measured benefit.
+     */
+    dependencyRelevance: boolean
+    /**
      * How a repair-scope answer combines with the existing derivation.
      * `union` keeps every path the findings observe or name and lets the
      * decision add to that set; `replace` takes the answer verbatim. See
@@ -125,6 +132,7 @@ export interface JevConfigInput {
     repairScope?: boolean
     routing?: boolean
     dedup?: boolean
+    dependencyRelevance?: boolean
     scopePolicy?: 'union' | 'replace'
     minProbability?: {
       repairScope?: number
@@ -149,6 +157,7 @@ export function resolveJevConfig(input: JevConfigInput | undefined): JevDecision
       repairScope: input?.decisions?.repairScope ?? true,
       routing: input?.decisions?.routing ?? true,
       dedup: input?.decisions?.dedup ?? true,
+      dependencyRelevance: input?.decisions?.dependencyRelevance ?? false,
       scopePolicy: input?.decisions?.scopePolicy ?? 'union',
       minProbability: {
         repairScope: input?.decisions?.minProbability?.repairScope ?? input?.minProbability ?? DEFAULT_JEV_MIN_PROBABILITY,
@@ -532,12 +541,82 @@ export function hintsFromAnswers(
   return hints
 }
 
+/** One completed dependency output offered for relevance judgement. */
+export interface JevDependencyItem {
+  readonly id: string
+  readonly subject: string
+  readonly output?: string
+}
+
+/** Input for the dependency-relevance decision. */
+export interface JevDependencySelectionInput {
+  /** The task about to be dispatched. */
+  readonly task: { id: string, subject: string, description?: string, objective?: string }
+  /** Completed dependency outputs the prompt would otherwise carry. */
+  readonly items: readonly JevDependencyItem[]
+}
+
+/** Per-item output budget inside the decision request, matching the prompt's own cap. */
+export const DEPENDENCY_DECISION_OUTPUT_MAX_CHARS = 2_000
+
+/**
+ * Build the dependency-relevance questions: one Noul per completed dependency.
+ *
+ * The question is about the TASK needing the output, not about the output being
+ * interesting. An output that merely restates what the task already knows is
+ * the case worth dropping, and stating that explicitly is what stops the model
+ * from keeping everything out of caution.
+ */
+export function buildDependencyQuestions(
+  task: JevDependencySelectionInput['task'],
+  items: readonly JevDependencyItem[],
+): Record<string, JevQuestion> {
+  const questions: Record<string, JevQuestion> = {}
+  for (const item of items) {
+    questions[`needs::${item.id}`] = {
+      type: 'noul',
+      instructions: [
+        `Task "${task.id}" (${task.subject}) is about to be dispatched to a worker.`,
+        `Does that worker need the output of the completed dependency "${item.id}" (${item.subject}) in order to do this task's work?`,
+        'Answer yes when the output carries something the worker must respect: a decision, a constraint, a number, a path, a hash, or a finding.',
+        'Answer no when the worker can do the task without it — a status summary, a restatement of the task, or work on an unrelated part of the project.',
+      ].join(' '),
+    }
+  }
+  return questions
+}
+
+/**
+ * Fold dependency-relevance answers into the ids to drop.
+ *
+ * Only a CONFIDENT "no" drops an item; yes and abstention both keep it, so an
+ * unreadable distribution can never discard context. Pure, and exported for
+ * tests: the failure direction here is what matters, not the happy path.
+ */
+export function droppedDependenciesFromAnswers(
+  answers: Record<string, JevAnswer> | undefined,
+  items: readonly JevDependencyItem[],
+  minProbability: number,
+): string[] {
+  const drop: string[] = []
+  for (const item of items) {
+    if (acceptedNoul(answers?.[`needs::${item.id}`], minProbability) === false) drop.push(item.id)
+  }
+  return drop
+}
+
 /** Interface implemented by the live client; a no-op implementation is used when the layer is off. */
 export interface JevDecisions {
   /** Whether a real decision call would be attempted for this input. */
   readonly enabled: boolean
   /** Resolve hints for one failed review. Never throws; returns `{}` on every failure path. */
   decide: (input: JevDecisionInput) => Promise<JevDecisionHints>
+  /**
+   * Choose which completed dependency outputs may be dropped from a dispatch
+   * prompt. Returns the ids to drop; an empty array means "keep everything",
+   * which is also every failure path.
+   */
+  selectDependencyOutputs: (input: JevDependencySelectionInput) => Promise<string[]>
 }
 
 /** A permanently disabled decision layer. */
@@ -545,6 +624,7 @@ export function disabledJevDecisions(): JevDecisions {
   return {
     enabled: false,
     decide: () => Promise.resolve({}),
+    selectDependencyOutputs: () => Promise.resolve([]),
   }
 }
 
@@ -814,6 +894,50 @@ export function createJevDecisions(
         const reason = error instanceof Error ? error.name : 'error'
         onDiagnostic(`agent-teams: Jev decision call unavailable (${reason}); falling back to heuristics`)
         return {}
+      }
+    },
+
+    async selectDependencyOutputs(input: JevDependencySelectionInput): Promise<string[]> {
+      try {
+        if (!config.decisions.dependencyRelevance) return []
+        if (input.items.length < 2) return []
+        const credential = await loadCredential()
+        if (credential === undefined) {
+          if (!missingReported) {
+            missingReported = true
+            onDiagnostic(`agent-teams: Jev decisions are enabled but no credential resolved (${config.apiKeyEnv}, TYPESAFE_API_KEY, or keychain ${config.keychainService}/${config.keychainAccount}); falling back to heuristics`)
+          }
+          return []
+        }
+        const items = input.items.slice(0, MAX_JEV_QUESTIONS)
+        const questions = buildDependencyQuestions(input.task, items)
+        const state = {
+          task: input.task,
+          completedDependencies: items.map((item) => ({
+            id: item.id,
+            subject: item.subject,
+            output: (item.output ?? '').slice(0, DEPENDENCY_DECISION_OUTPUT_MAX_CHARS),
+          })),
+        }
+        const response = await transport(`${config.baseUrl}/v1/systemone`, {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${credential.key}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ state, model: config.model, questions }),
+          signal: AbortSignal.timeout(config.timeoutMs),
+        })
+        if (!response.ok) {
+          onDiagnostic(`agent-teams: Jev dependency-relevance call failed with HTTP ${String(response.status)}; keeping every dependency output`)
+          return []
+        }
+        const body = await response.json() as { answers?: Record<string, JevAnswer> }
+        return droppedDependenciesFromAnswers(body.answers, items, config.minProbability)
+      } catch (error: unknown) {
+        const reason = error instanceof Error ? error.name : 'error'
+        onDiagnostic(`agent-teams: Jev dependency-relevance call unavailable (${reason}); keeping every dependency output`)
+        return []
       }
     },
   }

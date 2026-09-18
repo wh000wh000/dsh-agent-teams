@@ -36,6 +36,8 @@ import {
 } from '../lib/jev.js'
 import { completeTranslation, parseTranslationObject } from '../lib/jev-translate.js'
 import { Config } from '../lib/index.js'
+import { dependencyOutputsDiscardedByBudget, formatDependencyOutputs, trimDependencyOutputs } from '../lib/scheduler.js'
+import { buildDependencyQuestions, droppedDependenciesFromAnswers } from '../lib/jev.js'
 import {
   describeCredentialOrigin,
   readLoginKeychain,
@@ -77,7 +79,7 @@ function failedReview(extra = {}) {
 
 /** Build the decision block `hintsFromAnswers` expects, with optional overrides. */
 function makeDecisions(extra = {}) {
-  const base = { repairScope: true, routing: true, dedup: true, scopePolicy: 'union' }
+  const base = { repairScope: true, routing: true, dedup: true, dependencyRelevance: false, scopePolicy: 'union' }
   const decisions = { ...base, ...extra }
   return {
     ...decisions,
@@ -436,6 +438,7 @@ test('the default configuration is off', () => {
     repairScope: true,
     routing: true,
     dedup: true,
+    dependencyRelevance: false,
     scopePolicy: 'union',
     minProbability: { repairScope: 0.6, routing: 0.6, dedup: 0.6 },
   })
@@ -747,4 +750,122 @@ test('the calibrated dedup floor keeps a match the global floor would discard', 
   const calibrated = makeDecisions()
   calibrated.minProbability.dedup = 0.45
   assert.deepEqual(hintsFromAnswers(answers, { ...input, decisions: calibrated }).findingAliases, { F1: ['F0'] })
+})
+
+
+// ── dependency-output relevance: the layer chooses WHICH, never HOW MANY ─────
+
+/**
+ * A dependency list that blows the combined character budget.
+ *
+ * Each output is capped at 2,000 characters per item BEFORE the combined
+ * budget runs, so exceeding 12,000 takes at least seven items — a four-item
+ * fixture looks over budget and is not.
+ */
+function bigDependencies() {
+  return [1, 2, 3, 4, 5, 6, 7, 8].map((n) => ({ id: `t${n}`, subject: `done step ${n}`, output: 'x'.repeat(5_000) }))
+}
+
+test('the budget reports how many dependency outputs it would discard', () => {
+  assert.equal(dependencyOutputsDiscardedByBudget([]), 0)
+  assert.equal(dependencyOutputsDiscardedByBudget([{ id: 't1', subject: 's', output: 'short' }]), 0)
+  const discarded = dependencyOutputsDiscardedByBudget(bigDependencies())
+  assert.ok(discarded > 0, 'an over-budget list must report a discard')
+})
+
+
+test('only a confident "no" drops a dependency; yes and abstention keep it', () => {
+  const items = [{ id: 't1' }, { id: 't2' }, { id: 't3' }]
+  const dropped = droppedDependenciesFromAnswers({
+    'needs::t1': { type: 'noul', noul: 0.05 },
+    'needs::t2': { type: 'noul', noul: 0.95 },
+    'needs::t3': { type: 'noul', noul: 0.5 },
+  }, items, 0.6)
+  assert.deepEqual(dropped, ['t1'])
+})
+
+test('dependency questions name the task and every candidate', () => {
+  const questions = buildDependencyQuestions(
+    { id: 't9', subject: 'integrate the seam' },
+    [{ id: 't4', subject: 'verification run' }],
+  )
+  assert.match(questions['needs::t4'].instructions, /t9/u)
+  assert.match(questions['needs::t4'].instructions, /integrate the seam/u)
+})
+
+test('the dropped count is the budget\'s own count, whatever the layer says', async () => {
+  const items = bigDependencies()
+  const quota = dependencyOutputsDiscardedByBudget(items)
+  const ticket = { taskId: 't9', subject: 'final integration', dependencyOutputs: items }
+
+  const pickTwo = {
+    enabled: true,
+    decide: () => Promise.resolve({}),
+    selectDependencyOutputs: () => Promise.resolve(['t1', 't2']),
+  }
+  const kept = await trimDependencyOutputs({ stateDir: '.agent-teams', jev: pickTwo }, ticket)
+  assert.equal(kept.length, items.length - quota)
+
+  const everythingNeeded = {
+    enabled: true,
+    decide: () => Promise.resolve({}),
+    selectDependencyOutputs: () => Promise.resolve([]),
+  }
+  const unchanged = await trimDependencyOutputs({ stateDir: '.agent-teams', jev: everythingNeeded }, ticket)
+  const noLayer = await trimDependencyOutputs({ stateDir: '.agent-teams' }, ticket)
+  assert.deepEqual(unchanged.map((i) => i.id), noLayer.map((i) => i.id))
+})
+
+test('the layer cannot drop an output the budget would have kept, when the quota is spent', async () => {
+  const items = bigDependencies()
+  const quota = dependencyOutputsDiscardedByBudget(items)
+  const ticket = { taskId: 't9', subject: 'final integration', dependencyOutputs: items }
+  const everythingUnneeded = {
+    enabled: true,
+    decide: () => Promise.resolve({}),
+    selectDependencyOutputs: () => Promise.resolve(items.map((i) => i.id)),
+  }
+  const kept = await trimDependencyOutputs({ stateDir: '.agent-teams', jev: everythingUnneeded }, ticket)
+  assert.equal(kept.length, items.length - quota, 'a "drop everything" answer cannot exceed the quota')
+  assert.ok(kept.length > 0)
+})
+
+test('an under-budget dispatch never asks the layer at all', async () => {
+  let asked = 0
+  const jev = {
+    enabled: true,
+    decide: () => Promise.resolve({}),
+    selectDependencyOutputs: () => { asked += 1; return Promise.resolve([]) },
+  }
+  const ticket = {
+    taskId: 't9', subject: 's',
+    dependencyOutputs: [{ id: 't1', subject: 'a', output: 'tiny' }],
+  }
+  await trimDependencyOutputs({ stateDir: '.agent-teams', jev }, ticket)
+  assert.equal(asked, 0)
+})
+
+test('the formatter still keeps the tail and stays inside the budget', () => {
+  const rendered = formatDependencyOutputs(bigDependencies())
+  assert.ok(rendered.length <= 12_000 + 32, `rendered ${rendered.length} chars`)
+  assert.ok(rendered.includes('t8'), 'the nearest dependency must survive')
+  assert.ok(!rendered.includes('t1'), 'the earliest dependency is what gets dropped')
+})
+
+
+test('dependency relevance is off by default and stays off unless asked for', async () => {
+  let asked = 0
+  const decisions = createJevDecisions(
+    resolveJevConfig({ enabled: true, apiKeyEnv: 'K' }),
+    { K: 'x' },
+    {
+      fetch: () => { asked += 1; return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ answers: {} }) }) },
+    },
+  )
+  const dropped = await decisions.selectDependencyOutputs({
+    task: { id: 't9', subject: 's' },
+    items: [{ id: 't1' }, { id: 't2' }],
+  })
+  assert.deepEqual(dropped, [])
+  assert.equal(asked, 0, 'a disabled decision must not spend a request')
 })

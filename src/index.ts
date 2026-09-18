@@ -132,6 +132,13 @@ export interface Config {
       routing?: boolean
       dedup?: boolean
       /**
+       * Let the layer choose which completed dependency outputs the prompt
+       * budget spends itself on (default `false`). On the only real corpus
+       * available it judged every dependency needed and changed nothing, so it
+       * buys an extra request per over-budget dispatch for no measured gain.
+       */
+      dependencyRelevance?: boolean
+      /**
        * How a repair-scope answer combines with the existing derivation
        * (default `union`). `union` keeps every path the findings observe or
        * name and lets the decision add to that set; `replace` takes the
@@ -214,6 +221,7 @@ export const Config: z<Config> = z.object({
       repairScope: z.boolean(),
       routing: z.boolean(),
       dedup: z.boolean(),
+      dependencyRelevance: z.boolean(),
       scopePolicy: z.union([z.const('union'), z.const('replace')]),
       minProbability: z.object({
         repairScope: z.number().min(0).max(1),

@@ -43,6 +43,12 @@ export const DEPENDENCY_OUTPUTS_TOTAL_MAX_CHARS = 12_000
 export interface SchedulerConfig {
   readonly stateDir: string
   readonly executionPrompt?: string
+  /**
+   * Optional decision layer. It is consulted only when the dependency-output
+   * budget would actually discard something, so a team whose prompts fit pays
+   * nothing for it.
+   */
+  readonly jev?: import('./jev.ts').JevDecisions
   readonly dispatch?: (captain: Agent, teamId: string, memberName: string, text: string, signal: AbortSignal, mode: 'queue' | 'steer', attemptId?: string) => Promise<boolean>
 }
 
@@ -144,19 +150,28 @@ export function collectCompletedDependencyOutputs(
     })
 }
 
-/** Format completed-dependency outputs with per-item and total truncation. */
-export function formatDependencyOutputs(items: readonly DependencyOutput[]): string {
-  if (items.length === 0) return '(none)'
-  const formatted = items.map((item) => {
-    const seed = item.profileSeedId === undefined ? '' : ` [${item.profileSeedId}]`
-    const raw = item.output === undefined || item.output === ''
-      ? '(no output recorded)'
-      : item.output
-    const truncated = raw.length > DEPENDENCY_OUTPUT_MAX_CHARS
-    const body = truncated ? `${raw.slice(0, DEPENDENCY_OUTPUT_MAX_CHARS)} [truncated]` : raw
-    return `- ${item.id}${seed} ${item.subject}:\n  ${body}`
-  })
-  let selected = formatted
+/** Render one completed dependency output, truncating it to the per-item cap. */
+function formatDependencyOutput(item: DependencyOutput): string {
+  const seed = item.profileSeedId === undefined ? '' : ` [${item.profileSeedId}]`
+  const raw = item.output === undefined || item.output === ''
+    ? '(no output recorded)'
+    : item.output
+  const truncated = raw.length > DEPENDENCY_OUTPUT_MAX_CHARS
+  const body = truncated ? `${raw.slice(0, DEPENDENCY_OUTPUT_MAX_CHARS)} [truncated]` : raw
+  return `- ${item.id}${seed} ${item.subject}:\n  ${body}`
+}
+
+/**
+ * Apply the combined character budget to already-rendered items.
+ *
+ * Split out of the formatter so the scheduler can ask the SAME budget question
+ * the formatter answers — "would this discard anything?" — without duplicating
+ * the rule. The previous shape only ever returned the budgeted text, which is
+ * always within budget, so nothing downstream could tell that context had been
+ * thrown away.
+ */
+function applyDependencyBudget(formatted: readonly string[]): { kept: readonly string[]; discarded: number } {
+  let selected: readonly string[] = formatted
   while (selected.length > 1 && selected.join('\n').length > DEPENDENCY_OUTPUTS_TOTAL_MAX_CHARS) {
     selected = selected.slice(1)
   }
@@ -164,7 +179,23 @@ export function formatDependencyOutputs(items: readonly DependencyOutput[]): str
   if (selected.length === 1 && last !== undefined && last.length > DEPENDENCY_OUTPUTS_TOTAL_MAX_CHARS) {
     selected = [`${last.slice(0, DEPENDENCY_OUTPUTS_TOTAL_MAX_CHARS)} [truncated]`]
   }
-  return selected.join('\n')
+  return { kept: selected, discarded: formatted.length - selected.length }
+}
+
+/** Format completed-dependency outputs with per-item and total truncation. */
+export function formatDependencyOutputs(items: readonly DependencyOutput[]): string {
+  if (items.length === 0) return '(none)'
+  return applyDependencyBudget(items.map(formatDependencyOutput)).kept.join('\n')
+}
+
+/**
+ * How many completed dependency outputs the character budget currently
+ * discards. Zero means the budget is not binding and no relevance decision is
+ * worth making.
+ */
+export function dependencyOutputsDiscardedByBudget(items: readonly DependencyOutput[]): number {
+  if (items.length === 0) return 0
+  return applyDependencyBudget(items.map(formatDependencyOutput)).discarded
 }
 
 function stateRootOf(workspace: string, config: SchedulerConfig): string {
@@ -255,7 +286,65 @@ When finishing: use status=completed only when the task's success criteria are s
 State policy: ${stateDir}/${teamId}/ is read-only diagnostics; mutate team state only through agent_teams_* tools.`
 }
 
-/** Install one scheduler and its member activity observer. */
+/**
+ * Let the decision layer choose WHICH completed dependency outputs the budget
+ * spends itself on — never how many.
+ *
+ * The first implementation filtered out everything the layer called unneeded
+ * and left the remainder to the character budget. That quietly broke the
+ * safety property it claimed: the layer could discard an output the budget was
+ * going to keep, so a wrong "no" cost more context than the status quo.
+ *
+ * The rule here is narrower and checkable. The budget's own answer — how many
+ * rendered items it would discard — is the quota. The layer may only choose
+ * which items that quota falls on, preferring the ones it judged unneeded and
+ * filling any remainder from the front exactly as before. So:
+ *
+ *   - the number of items dropped is identical to the status quo;
+ *   - the character budget still applies afterwards, unchanged;
+ *   - if the layer is off, abstains, or answers "needed", the dropped set is
+ *     byte-identical to what it would have been.
+ *
+ * The quota is counted in items because that is the unit the formatter's own
+ * decision is expressed in; the character accounting stays where it was.
+ */
+export async function trimDependencyOutputs(
+  config: SchedulerConfig,
+  ticket: { taskId: string, subject: string, description?: string, objective?: string, dependencyOutputs: readonly DependencyOutput[] },
+): Promise<readonly DependencyOutput[]> {
+  const offered = ticket.dependencyOutputs
+  if (offered.length < 2) return offered
+  const quota = dependencyOutputsDiscardedByBudget(offered)
+  if (quota <= 0) return offered
+  if (config.jev?.enabled !== true) return offered
+  const unneeded = new Set(await config.jev.selectDependencyOutputs({
+    task: {
+      id: ticket.taskId,
+      subject: ticket.subject,
+      ...ticket.description === undefined ? {} : { description: ticket.description },
+      ...ticket.objective === undefined ? {} : { objective: ticket.objective },
+    },
+    items: offered.map((item) => ({ id: item.id, subject: item.subject, output: item.output })),
+  }).catch(() => []))
+  if (unneeded.size === 0) return offered
+
+  const drop = new Set<string>()
+  // Spend the quota on the outputs the layer judged unneeded, in their own order.
+  for (const item of offered) {
+    if (drop.size >= quota) break
+    if (unneeded.has(item.id)) drop.add(item.id)
+  }
+  // Any quota the layer did not use falls on the front, exactly as before.
+  for (const item of offered) {
+    if (drop.size >= quota) break
+    if (!drop.has(item.id)) drop.add(item.id)
+  }
+  const kept = offered.filter((item) => !drop.has(item.id))
+  // The formatter keeps at least one item; never hand it an empty list.
+  return kept.length === 0 ? offered.slice(-1) : kept
+}
+
+/** Install one scheduler and its member activity observer. *//** Install one scheduler and its member activity observer. */
 export function installTeamScheduler(ctx: Context, config: SchedulerConfig): TeamScheduler {
   const memberQueues = new Map<string, Promise<unknown>>()
   // An idle edge in this process proves that the resident member ended its
@@ -412,7 +501,11 @@ export function installTeamScheduler(ctx: Context, config: SchedulerConfig): Tea
         })
         if (ticket === undefined) return
 
-        const prompt = assignmentPrompt(ticket, config.stateDir, team.id)
+        const prompt = assignmentPrompt(
+          { ...ticket, dependencyOutputs: await trimDependencyOutputs(config, ticket) },
+          config.stateDir,
+          team.id,
+        )
         const signal = new AbortController().signal
         const accepted = config.dispatch === undefined
           ? await deliverToMember(ctx, captain, ticket.memberId, prompt, signal)

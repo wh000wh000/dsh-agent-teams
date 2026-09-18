@@ -33,6 +33,7 @@ import {
   topProbability,
 } from '../lib/jev.js'
 import { completeTranslation, parseTranslationObject } from '../lib/jev-translate.js'
+import { Config } from '../lib/index.js'
 import {
   describeCredentialOrigin,
   readLoginKeychain,
@@ -481,4 +482,45 @@ test('the credential origin description never contains the secret', () => {
 test('the real keychain reader reports absence instead of throwing', async () => {
   const missing = await readLoginKeychain('dsh-agent-teams-nonexistent-service', 'none')
   assert.equal(missing, undefined)
+})
+
+
+// ── plugin config parsing ───────────────────────────────────────────────────
+//
+// Schemastery gives a nested `z.object()` an implicit `{}` default, so an
+// optional nested block whose inner fields are required rejects a config that
+// never mentioned it. That failure happens at plugin MOUNT time, which means a
+// single missing `.const(undefined)` arm takes the whole harness row down.
+// These cases are the ones an operator can actually write.
+
+test('a minimal enable block parses and resolves', () => {
+  const parsed = new Config({
+    stateDir: '.agent-teams',
+    memberProvider: 'spawn',
+    jev: {
+      enabled: true,
+      model: 'jev-1.13.0',
+      decisions: { repairScope: true, routing: true, dedup: true, scopePolicy: 'union' },
+    },
+  })
+  const resolved = resolveJevConfig(parsed.jev)
+  assert.equal(resolved.enabled, true)
+  assert.equal(resolved.model, 'jev-1.13.0')
+  assert.equal(resolved.decisions.scopePolicy, 'union')
+  assert.equal(resolved.keychainService, 'typesafe-jev')
+})
+
+test('omitting the jev block entirely parses', () => {
+  const parsed = new Config({ stateDir: '.agent-teams', memberProvider: 'spawn' })
+  assert.equal(resolveJevConfig(parsed.jev).enabled, false)
+})
+
+test('an explicit translation route parses without requiring the rest', () => {
+  const parsed = new Config({
+    stateDir: '.agent-teams',
+    memberProvider: 'spawn',
+    jev: { enabled: true, translation: { provider: 'anthropic', model: 'claude-sonnet-4-5' } },
+  })
+  assert.equal(parsed.jev.translation.model, 'claude-sonnet-4-5')
+  assert.equal(resolveJevConfig(parsed.jev).enabled, true)
 })

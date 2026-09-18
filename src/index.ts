@@ -216,10 +216,14 @@ export const Config: z<Config> = z.object({
       dedup: z.boolean(),
       scopePolicy: z.union([z.const('union'), z.const('replace')]),
     }),
-    translation: z.object({
-      provider: z.string().required(),
-      model: z.string().required(),
-    }),
+    // Same Schemastery trap the fallback route documents above: a nested
+    // `z.object()` defaults to `{}`, which would then fail on the required
+    // provider/model keys even though the operator never asked for an explicit
+    // translation route. Model absence explicitly instead.
+    translation: z.union([
+      z.object({ provider: z.string().required(), model: z.string().required() }),
+      z.const(undefined),
+    ]),
   }),
 })
 

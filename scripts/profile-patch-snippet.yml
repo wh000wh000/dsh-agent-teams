@@ -1,0 +1,37 @@
+# ── AgentTeams × Jev 决策层 ─────────────────────────────────────────────────
+# 2026-09-18。给「自动修复轮次」的规划加一层语义判断：修复范围、交付者/
+# 评审者、跨轮同源去重。默认关闭；这里显式打开。
+#
+# 为什么要重写整个 config：loader 规则是 **id 命中的条目整体替换该行 config**
+# （不合并），所以 stateDir / memberProvider 必须一并写出，否则会被清空。
+#
+# 凭据：key 在 macOS 登录钥匙串 typesafe-jev/default，插件自己取，
+# **不落盘、不进命令行、不进日志**。宿主进程的环境变量里没有它，这正是
+# 走钥匙串的原因（launchd 的 EnvironmentVariables 是固定的）。如果哪天想用
+# 环境变量覆盖，启动 dsh 前 export JEV_API_KEY=… 即可，优先级更高。
+#
+# 模型锁 jev-1.13.0 而不是 jev-latest：别名一动，阈值会在没改代码的情况下失效。
+# minProbability 0.6 是官方弃权起点，不是标定值 —— 中文负载要按自己的带标签
+# 样本重标（实测有正确项落在 0.53，会被 0.6 丢掉）。
+#
+# scopePolicy: union 是安全方向 —— 决策可以补上散文里扫不出来的路径，但不会
+# 删掉 finding 观察到或点名的路径；换成 replace 会收紧但可能让 repair 改不动
+# 自己 inScope 之外的文件而永久卡住。
+#
+# 非英文负载：入 Jev 前按白名单槽位翻成英文，翻译路由取评审成员自己的模型。
+# 没有可用路由时**弃权且不调 API**，不会把读不准的负载发出去。
+#
+# 上线前注意：minProbability 尚未用真实 finding 标定，置换测试与方差采样也还没做。
+- id: agent-teams
+  config:
+    stateDir: .agent-teams
+    memberProvider: spawn
+    jev:
+      enabled: true
+      model: jev-1.13.0
+      minProbability: 0.6
+      decisions:
+        repairScope: true
+        routing: true
+        dedup: true
+        scopePolicy: union

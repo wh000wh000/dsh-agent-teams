@@ -11,10 +11,15 @@
  *   bash -c 'source ~/.agents/skills/jev/scripts/credentials/jev_keychain.sh; node scripts/jev-e2e.mjs'
  */
 import { createJevDecisions, resolveJevConfig } from '../lib/jev.js'
+import { describeCredentialOrigin, resolveJevCredential } from '../lib/jev-credential.js'
 import { planQualityFollowUp } from '../lib/quality-gates.js'
 
-const key = process.env.JEV_KEY?.trim()
-if (key === undefined || key === '') throw new Error('JEV_KEY missing: source the keychain helper first')
+// Production credential path: environment first, then the login keychain.
+// Nothing is exported and no secret is printed.
+const env = { JEV_API_KEY: process.env.JEV_API_KEY, TYPESAFE_API_KEY: process.env.TYPESAFE_API_KEY }
+const credential = await resolveJevCredential({ apiKeyEnv: 'JEV_API_KEY', env })
+if (credential === undefined) throw new Error('no Jev credential: set JEV_API_KEY or store the typesafe-jev/default keychain item')
+console.log(`credential source: ${describeCredentialOrigin(credential.origin)} (value never printed)\n`)
 
 const member = (name, role, executionPrompt, extra = {}) => ({
   id: `member-${name}`, name, role, executionPrompt, joinedAt: 0, status: 'idle', ...extra,
@@ -87,7 +92,7 @@ function report(label, hints, planned) {
 }
 
 // 1. English review, live decision call, no translator needed.
-const english = createJevDecisions(config, { JEV_KEY: key }, {
+const english = createJevDecisions(config, {}, {
   onDiagnostic: (message) => diagnostics.push(message),
 })
 const englishHints = await english.decide({ team, closed: englishReview, scopeCandidates })
@@ -95,7 +100,7 @@ report('live · English review', englishHints, planQualityFollowUp(team, english
 
 // 2. Chinese review with no translator: must abstain without calling the API.
 let apiCalls = 0
-const guarded = createJevDecisions(config, { JEV_KEY: key }, {
+const guarded = createJevDecisions(config, {}, {
   fetch: (...args) => { apiCalls += 1; return globalThis.fetch(...args) },
   onDiagnostic: (message) => diagnostics.push(message),
 })
@@ -126,7 +131,7 @@ const translator = {
     return resolved
   },
 }
-const translated = createJevDecisions(config, { JEV_KEY: key }, {
+const translated = createJevDecisions(config, {}, {
   translator,
   fetch: async (url, init) => {
     translatedSends.push(JSON.parse(init.body))

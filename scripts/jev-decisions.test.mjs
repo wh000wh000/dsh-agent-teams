@@ -33,6 +33,11 @@ import {
   topProbability,
 } from '../lib/jev.js'
 import { completeTranslation, parseTranslationObject } from '../lib/jev-translate.js'
+import {
+  describeCredentialOrigin,
+  readLoginKeychain,
+  resolveJevCredential,
+} from '../lib/jev-credential.js'
 
 function finding(extra = {}) {
   return { id: 'F1', severity: 'high', problem: 'a defect', requiredFix: 'fix it in codes.ts.', ...extra }
@@ -337,15 +342,24 @@ test('a thrown transport error is a fail-open', async () => {
   assert.deepEqual(hints, {})
 })
 
-test('an enabled layer without its key disables itself', () => {
+test('an enabled layer with no resolvable credential is configured but abstains', async () => {
   const diagnostics = []
   const decisions = createJevDecisions(
     resolveJevConfig({ enabled: true, apiKeyEnv: 'MISSING_KEY' }),
     {},
-    { onDiagnostic: (message) => diagnostics.push(message) },
+    {
+      credential: () => Promise.resolve(undefined),
+      onDiagnostic: (message) => diagnostics.push(message),
+    },
   )
-  assert.equal(decisions.enabled, false)
-  assert.ok(diagnostics.some((line) => line.includes('MISSING_KEY')))
+  assert.equal(decisions.enabled, true)
+  const hints = await decisions.decide({
+    team: team(),
+    closed: failedReview({ findings: [finding({ problem: 'english only' })] }),
+    scopeCandidates: ['a.ts'],
+  })
+  assert.deepEqual(hints, {})
+  assert.equal(diagnostics.filter((line) => line.includes('MISSING_KEY')).length, 1, 'a missing credential is reported once')
 })
 
 test('the default configuration is off', () => {
@@ -391,4 +405,80 @@ test('a partial translation is rejected whole rather than mixed with the origina
   assert.equal(completeTranslation(slots, { 'findings[*].problem#0': 'one' }), undefined)
   const complete = completeTranslation(slots, { 'findings[*].problem#0': 'one', 'findings[*].requiredFix#0': 'two' })
   assert.equal(complete.get('findings[*].requiredFix#0'), 'two')
+})
+
+// ── credential resolution never persists or prints the secret ───────────────
+
+test('an explicit environment variable wins over the official name and the keychain', async () => {
+  let keychainReads = 0
+  const credential = await resolveJevCredential({
+    apiKeyEnv: 'JEV_API_KEY',
+    env: { JEV_API_KEY: 'primary', TYPESAFE_API_KEY: 'secondary' },
+    platform: 'darwin',
+    readKeychain: () => { keychainReads += 1; return Promise.resolve('keychain') },
+  })
+  assert.equal(credential.key, 'primary')
+  assert.equal(keychainReads, 0)
+})
+
+test('the official SDK variable is used when the primary one is unset', async () => {
+  const credential = await resolveJevCredential({
+    apiKeyEnv: 'JEV_API_KEY',
+    env: { TYPESAFE_API_KEY: 'secondary' },
+    platform: 'darwin',
+    readKeychain: () => Promise.resolve('keychain'),
+  })
+  assert.equal(credential.key, 'secondary')
+  assert.deepEqual(credential.origin, { kind: 'environment', name: 'TYPESAFE_API_KEY' })
+})
+
+test('the keychain is the last resort, and only on macOS', async () => {
+  const onMac = await resolveJevCredential({
+    apiKeyEnv: 'JEV_API_KEY',
+    env: {},
+    platform: 'darwin',
+    readKeychain: () => Promise.resolve('from-keychain'),
+  })
+  assert.deepEqual(onMac.origin, { kind: 'keychain', service: 'typesafe-jev', account: 'default' })
+  const elsewhere = await resolveJevCredential({
+    apiKeyEnv: 'JEV_API_KEY',
+    env: {},
+    platform: 'linux',
+    readKeychain: () => Promise.resolve('from-keychain'),
+  })
+  assert.equal(elsewhere, undefined)
+})
+
+test('an empty or whitespace credential is not a credential', async () => {
+  assert.equal(await resolveJevCredential({ apiKeyEnv: 'JEV_API_KEY', env: { JEV_API_KEY: '   ' }, platform: 'linux' }), undefined)
+  assert.equal(await resolveJevCredential({
+    apiKeyEnv: 'JEV_API_KEY',
+    env: {},
+    platform: 'darwin',
+    readKeychain: () => Promise.resolve(''),
+  }), undefined)
+})
+
+test('a keychain failure resolves to nothing rather than throwing', async () => {
+  const credential = await resolveJevCredential({
+    apiKeyEnv: 'JEV_API_KEY',
+    env: {},
+    platform: 'darwin',
+    readKeychain: () => Promise.resolve(undefined),
+  })
+  assert.equal(credential, undefined)
+})
+
+test('the credential origin description never contains the secret', () => {
+  const described = describeCredentialOrigin({ kind: 'keychain', service: 'typesafe-jev', account: 'default' })
+  assert.equal(described, 'keychain item typesafe-jev/default')
+  assert.equal(
+    describeCredentialOrigin({ kind: 'environment', name: 'JEV_API_KEY' }),
+    'environment variable JEV_API_KEY',
+  )
+})
+
+test('the real keychain reader reports absence instead of throwing', async () => {
+  const missing = await readLoginKeychain('dsh-agent-teams-nonexistent-service', 'none')
+  assert.equal(missing, undefined)
 })

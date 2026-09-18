@@ -39,6 +39,13 @@
  */
 
 import type { ReviewFinding, TeamState, TeamTask } from './types.ts'
+import {
+  DEFAULT_KEYCHAIN_ACCOUNT,
+  DEFAULT_KEYCHAIN_SERVICE,
+  describeCredentialOrigin,
+  resolveJevCredential,
+  type JevCredential,
+} from './jev-credential.ts'
 import type { JevDecisionHints } from './quality-gates.ts'
 import { repairScopeFromFindings } from './quality-gates.ts'
 
@@ -67,6 +74,10 @@ export interface JevDecisionConfig {
   model: string
   /** Name of the environment variable holding the API key. */
   apiKeyEnv: string
+  /** Keychain service holding the API key when no environment variable does. */
+  keychainService: string
+  /** Keychain account holding the API key when no environment variable does. */
+  keychainAccount: string
   /** End-to-end timeout in milliseconds; expiry is a fail-open. */
   timeoutMs: number
   /** Top-probability floor below which an answer is discarded. */
@@ -92,6 +103,8 @@ export interface JevConfigInput {
   baseUrl?: string
   model?: string
   apiKeyEnv?: string
+  keychainService?: string
+  keychainAccount?: string
   timeoutMs?: number
   minProbability?: number
   decisions?: {
@@ -109,6 +122,8 @@ export function resolveJevConfig(input: JevConfigInput | undefined): JevDecision
     baseUrl: (input?.baseUrl ?? DEFAULT_JEV_BASE_URL).replace(/\/+$/u, ''),
     model: input?.model ?? 'jev-latest',
     apiKeyEnv: input?.apiKeyEnv ?? DEFAULT_JEV_API_KEY_ENV,
+    keychainService: input?.keychainService ?? DEFAULT_KEYCHAIN_SERVICE,
+    keychainAccount: input?.keychainAccount ?? DEFAULT_KEYCHAIN_ACCOUNT,
     timeoutMs: input?.timeoutMs ?? 4_000,
     minProbability: input?.minProbability ?? DEFAULT_JEV_MIN_PROBABILITY,
     decisions: {
@@ -489,6 +504,11 @@ export interface JevDecisionDeps {
    * failed review exist, not at plugin mount time.
    */
   translator?: JevTextTranslator | ((input: JevDecisionInput) => JevTextTranslator | undefined)
+  /**
+   * Credential resolver override. Defaults to environment-then-keychain
+   * resolution; injected so tests never read a real secret.
+   */
+  credential?: () => Promise<JevCredential | undefined>
   /** Receives one short line per failed or skipped call; never receives the credential. */
   onDiagnostic?: (message: string) => void
 }
@@ -591,17 +611,44 @@ export function createJevDecisions(
 ): JevDecisions {
   const { fetch: fetchImpl, onDiagnostic = () => {} } = deps
   if (!config.enabled) return disabledJevDecisions()
-  const apiKey = env[config.apiKeyEnv]?.trim() ?? ''
-  if (apiKey === '') {
-    onDiagnostic(`agent-teams: Jev decisions are enabled but ${config.apiKeyEnv} is unset; falling back to heuristics`)
-    return disabledJevDecisions()
-  }
   const transport = fetchImpl ?? (globalThis.fetch as unknown as JevFetch)
+
+  // The credential is resolved on first use, not at mount. Mount happens while
+  // the profile is still activating, where a keychain read would be both
+  // premature and unobservable; use time is where a missing credential can be
+  // reported next to the decision it prevented. The attempt is cached, so a
+  // failed resolution is reported once rather than on every failed review.
+  let credentialAttempt: Promise<JevCredential | undefined> | undefined
+  let missingReported = false
+  let originReported = false
+  const loadCredential = (): Promise<JevCredential | undefined> => {
+    credentialAttempt ??= (deps.credential ?? (() => resolveJevCredential({
+      apiKeyEnv: config.apiKeyEnv,
+      env,
+      service: config.keychainService,
+      account: config.keychainAccount,
+    })))()
+    return credentialAttempt
+  }
 
   return {
     enabled: true,
     async decide(input: JevDecisionInput): Promise<JevDecisionHints> {
       try {
+        const credential = await loadCredential()
+        if (credential === undefined) {
+          if (!missingReported) {
+            missingReported = true
+            onDiagnostic(`agent-teams: Jev decisions are enabled but no credential resolved (${config.apiKeyEnv}, TYPESAFE_API_KEY, or keychain ${config.keychainService}/${config.keychainAccount}); falling back to heuristics`)
+          }
+          return {}
+        }
+        const apiKey = credential.key
+        if (!originReported) {
+          originReported = true
+          // Names where the credential came from, never the credential.
+          onDiagnostic(`agent-teams: Jev decisions using the credential from ${describeCredentialOrigin(credential.origin)}`)
+        }
         const findings = (input.closed.findings ?? []).filter((finding) => finding.resolved !== true)
         const findingIds = findings.map((finding) => finding.id)
         if (findingIds.length === 0) return {}

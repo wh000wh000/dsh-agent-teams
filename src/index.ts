@@ -109,6 +109,14 @@ export interface Config {
     model?: string
     /** Environment variable holding the API key (default `JEV_API_KEY`). */
     apiKeyEnv?: string
+    /**
+     * Keychain item read when no environment variable holds the key (default
+     * `typesafe-jev` / `default`). The key is never written to team state, a
+     * log line, or the process command line.
+     */
+    keychainService?: string
+    /** Keychain account paired with `keychainService`. */
+    keychainAccount?: string
     /** End-to-end timeout in milliseconds (default `4000`). */
     timeoutMs?: number
     /**
@@ -198,6 +206,8 @@ export const Config: z<Config> = z.object({
     baseUrl: z.string(),
     model: z.string(),
     apiKeyEnv: z.string(),
+    keychainService: z.string(),
+    keychainAccount: z.string(),
     timeoutMs: z.natural().min(1),
     minProbability: z.number().min(0).max(1),
     decisions: z.object({

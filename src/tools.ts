@@ -55,6 +55,7 @@ import {
   taskKindOf,
 } from './state.ts'
 import type { ContractAmendmentInput } from './state.ts'
+import { collectRepairScopeCandidates, type JevDecisionHints } from './quality-gates.ts'
 import type { AcceptanceResult, CommandResult, ReviewFinding, ReviewVerdict, TaskKind } from './types.ts'
 import {
   deliverToMember,
@@ -93,6 +94,12 @@ export interface ToolsConfig {
   maxMembers: number
   /** Named team profiles from the active DSH profile. */
   profiles: Record<string, import('./profiles.ts').TeamProfileConfig>
+  /**
+   * Optional semantic decision layer used by the automatic quality-gate loop.
+   * Absent means the loop keeps its pure heuristics; a present layer is
+   * advisory and fail-open, so every hint it returns may be discarded.
+   */
+  jev?: import('./jev.ts').JevDecisions
 }
 
 /** Browser/UI mutations allowed while a plan is waiting for approval. */
@@ -1736,8 +1743,24 @@ export function registerAgentTeamsTools(ctx: Context, config: ToolsConfig): Agen
         if (acceptanceResults !== undefined) task.acceptanceResults = acceptanceResults
         if (commandsRun !== undefined) task.commandsRun = commandsRun
         task.updatedAt = Date.now()
+        // Resolve the semantic decisions BEFORE planning, and only on the
+        // failure path that opens a revision loop: this is the only place the
+        // decision layer runs, so its latency and cost never touch an ordinary
+        // task update. `decide` is fail-open and never throws, but it is
+        // awaited defensively so a broken decision service cannot take down
+        // the quality gate that would otherwise run without it.
+        const hints = task.status === 'failed'
+          && (task.verdict === 'needs_revision' || task.verdict === 'reject')
+          && config.jev !== undefined
+          && config.jev.enabled
+          ? await config.jev.decide({
+              team: fresh,
+              closed: task,
+              scopeCandidates: collectRepairScopeCandidates(fresh, task),
+            }).catch(() => ({}))
+          : undefined
         const followUp = (task.status === 'failed' && (task.verdict === 'needs_revision' || task.verdict === 'reject'))
-          ? applyQualityFollowUp(fresh, task)
+          ? applyQualityFollowUp(fresh, task, hints)
           : undefined
         if (followUp?.escalated === true) {
           await appendMailbox(stateRoot, fresh.id, CAPTAIN_KEY, createMessage(
@@ -2375,8 +2398,12 @@ function parseCommandResults(value: unknown): CommandResult[] | undefined {
   })
 }
 
-export function applyQualityFollowUp(team: TeamState, closed: TeamTask): { created: TeamTask[]; escalated: boolean } {
-  const planned = planQualityFollowUp(team, closed)
+export function applyQualityFollowUp(
+  team: TeamState,
+  closed: TeamTask,
+  hints?: JevDecisionHints,
+): { created: TeamTask[]; escalated: boolean } {
+  const planned = planQualityFollowUp(team, closed, hints)
   if (planned.escalated === true) team.escalated = true
   const created: TeamTask[] = []
   const existing = [...team.tasks]

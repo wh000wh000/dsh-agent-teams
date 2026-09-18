@@ -115,6 +115,55 @@ export interface PlanQualityFollowUpResult {
   status?: 'escalated'
 }
 
+/**
+ * Optional semantic decisions supplied by the Jev decision layer.
+ *
+ * Every field is a HINT, and this module stays pure: it neither performs I/O
+ * nor imports a client. The caller resolves hints before calling in, and an
+ * absent, empty, or invalid hint degrades to exactly the heuristic this
+ * function used before hints existed. That property is what makes the layer
+ * safe to enable per team and to fail open when the decision service is
+ * unreachable.
+ */
+export interface JevDecisionHints {
+  /**
+   * Paths the decision says must change to resolve the findings. Ignored when
+   * empty, so a decision that finds nothing keeps the heuristic fallback
+   * instead of producing an unscoped repair.
+   */
+  repairInScope?: string[]
+  /**
+   * How `repairInScope` combines with the existing derivation.
+   *
+   * `union` (the default) is the safe direction and the one this repository
+   * already commits to: the generated scope always keeps every file a finding
+   * was OBSERVED in and every path-shaped token its `requiredFix` names, and
+   * the decision may only ADD paths the token scan missed (prose with no
+   * path-shaped token, a directory named instead of a file). Dropping a path
+   * the prose names is what produced the unsatisfiable contracts in issue
+   * #173, so it is not the default.
+   *
+   * `replace` takes the decision's answer verbatim. It is tighter — a
+   * citation the scan picked up is removed — but it can narrow the scope
+   * below what the acceptance criteria require, and a repair that must edit a
+   * path outside its own `inScope` can never complete. Choose it only after
+   * calibrating the decision on your own labelled findings.
+   */
+  scopePolicy?: 'union' | 'replace'
+  /** Member name chosen for the generated repair task. */
+  implementer?: string
+  /** Member name chosen for the following review task. */
+  reviewer?: string
+  /**
+   * Canonical finding id per incoming finding id. A finding that semantically
+   * repeats an earlier one maps onto that earlier id, so the repair-attempt
+   * budget is keyed on the DEFECT rather than on the wording a reviewer chose
+   * this round. Without aliases, renaming a finding id resets the counter and
+   * the loop cap can be bypassed.
+   */
+  findingAliases?: Record<string, string>
+}
+
 export interface CoverageRow {
   goal_item: string
   task_ids: string[]
@@ -544,8 +593,28 @@ function unresolvedFindings(task: TeamTask): ReviewFinding[] {
   return (task.findings ?? []).filter((finding) => finding.resolved !== true)
 }
 
-function findingKey(ids: readonly string[]): string {
-  return [...ids].sort().join(',')
+/**
+ * Canonicalize one finding id through the semantic alias table.
+ *
+ * `findingAliases` maps a finding id onto the id of an earlier finding that
+ * reports the SAME underlying defect. Collapsing both ids onto one canonical
+ * id is what makes the repair budget survive a reviewer renaming its finding
+ * between rounds. Aliases are followed transitively (bounded by the table
+ * size) so an incoming id may itself alias an already-aliased id.
+ */
+function canonicalFindingId(id: string, aliases: Readonly<Record<string, string>> | undefined): string {
+  if (aliases === undefined) return id
+  let current = id
+  for (let hop = 0; hop < 8; hop += 1) {
+    const next = aliases[current]
+    if (next === undefined || next === current) return current
+    current = next
+  }
+  return current
+}
+
+function findingKey(ids: readonly string[], aliases?: Readonly<Record<string, string>>): string {
+  return [...ids].map((id) => canonicalFindingId(id, aliases)).sort().join(',')
 }
 
 /**
@@ -557,6 +626,18 @@ function findingKey(ids: readonly string[]): string {
  */
 const REPAIR_SCOPE_PATH_PATTERN = /(?:[A-Za-z0-9_.\-]+(?:\/[A-Za-z0-9_.\-]+)+|[\w.\-]+\.(?:tsx?|jsx?|mjs|cjs|json|md|txt|ya?ml|py|rs|go|java|html?|css|scss|sh|ps1|toml|xml|sql))(?::\d+)?/gu
 const REPAIR_SCOPE_LINE_SUFFIX = /:\d+$/
+/**
+ * Punctuation a prose sentence glues onto a path-shaped token.
+ *
+ * The candidate pattern admits `.` so it can match `wc.js`, but that also lets
+ * a sentence period become part of the match: "fix it in codes.ts. See …"
+ * yielded the scope entry `codes.ts.`, which no real file can satisfy, so the
+ * generated repair rejected every changedPath as `undeclared` and the task
+ * could never complete. Only a trailing line suffix and trailing periods are
+ * removed, and only from prose-derived tokens; `finding.file` is authored data
+ * and is normalized exactly as written.
+ */
+const REPAIR_SCOPE_PROSE_EDGE = /(?::\d+)?\.+$/u
 
 /**
  * Derive the repair round's inScope from the findings that caused it.
@@ -589,9 +670,49 @@ export function repairScopeFromFindings(
   }
   for (const finding of findings) {
     if (nonemptyString(finding.file)) push(finding.file)
-    for (const match of finding.requiredFix.matchAll(REPAIR_SCOPE_PATH_PATTERN)) push(match[0])
+    for (const match of finding.requiredFix.matchAll(REPAIR_SCOPE_PATH_PATTERN)) {
+      push(match[0].replace(REPAIR_SCOPE_PROSE_EDGE, ''))
+    }
   }
   return derived.length > 0 ? derived : fallback === undefined ? undefined : [...new Set(fallback)]
+}
+
+/**
+ * Build the CANDIDATE path set a semantic repair-scope decision chooses from.
+ *
+ * The regex derivation above is excellent recall and poor precision: it finds
+ * every path-shaped token in the prose, including citations and a trailing
+ * sentence period. Recall is exactly what a candidate generator needs, so this
+ * collector unions that output with the evidence the task already carries —
+ * the observed files, the declared scopes, and the paths the implementation
+ * actually changed — and hands the whole set to a decision that can then say
+ * "exclude" for an individual candidate. A decision layer that abstains
+ * leaves the caller with the regex derivation it always used.
+ */
+export function collectRepairScopeCandidates(team: TeamState, closed: TeamTask): string[] {
+  const sourceId = closed.reviewedTaskId ?? closed.sourceTaskId
+  const source = sourceId === undefined ? undefined : team.tasks.find((item) => item.id === sourceId)
+  const findings = unresolvedFindings(closed)
+  const candidates = new Set<string>()
+  for (const finding of findings) {
+    if (nonemptyString(finding.file)) {
+      const normalized = normalizeWorkspacePath(finding.file)
+      if (normalized !== undefined) candidates.add(normalized)
+    }
+  }
+  for (const pattern of [...(source?.inScope ?? []), ...(source?.outOfScope ?? [])]) {
+    const normalized = normalizeWorkspacePath(pattern.replace(/\/+$/u, ''))
+    if (normalized !== undefined) candidates.add(normalized)
+  }
+  for (const path of source?.changedPaths ?? []) {
+    const normalized = normalizeWorkspacePath(path)
+    if (normalized !== undefined) candidates.add(normalized)
+  }
+  for (const derived of repairScopeFromFindings(findings, source?.inScope) ?? []) {
+    const normalized = normalizeWorkspacePath(derived)
+    if (normalized !== undefined) candidates.add(normalized)
+  }
+  return [...candidates].sort()
 }
 
 /** Captain-only amendment payload: replacement values for contract fields. */
@@ -722,21 +843,54 @@ function schedulableAssignee(preferred: string | undefined, team: TeamState, for
   ))?.name
 }
 
-function countRepairAttempts(team: TeamState, sourceTaskId: string, findingIds: readonly string[]): number {
-  const key = findingKey(findingIds)
+/**
+ * Resolve a hint-supplied assignee, or fall back to the positional heuristic.
+ *
+ * A hint is honored only when it names an ACTIVE roster member the caller is
+ * allowed to use. Anything else — an unknown name, a removed member, the
+ * captain, or the forbidden member — is discarded and the heuristic runs
+ * exactly as it did before hints existed. The decision service therefore
+ * cannot widen who is schedulable; it can only order the members the runtime
+ * already accepts.
+ */
+function hintedAssignee(
+  hint: string | undefined,
+  preferred: string | undefined,
+  team: TeamState,
+  forbidden?: string,
+): string | undefined {
+  if (hint !== undefined && hint !== '' && hint !== CAPTAIN_ASSIGNEE && hint !== forbidden) {
+    const live = team.members.find((member) => member.name === hint && member.status !== 'removed')
+    if (live !== undefined) return live.name
+  }
+  return schedulableAssignee(preferred, team, forbidden)
+}
+
+function countRepairAttempts(
+  team: TeamState,
+  sourceTaskId: string,
+  findingIds: readonly string[],
+  aliases?: Readonly<Record<string, string>>,
+): number {
+  const key = findingKey(findingIds, aliases)
   return team.tasks.filter((item) => (
     taskKindOf(item) === 'repair'
     && item.sourceTaskId === sourceTaskId
-    && findingKey(item.sourceFindingIds ?? []) === key
+    && findingKey(item.sourceFindingIds ?? [], aliases) === key
   )).length
 }
 
-function hasOpenFollowUp(team: TeamState, sourceTaskId: string, findingIds: readonly string[]): boolean {
-  const key = findingKey(findingIds)
+function hasOpenFollowUp(
+  team: TeamState,
+  sourceTaskId: string,
+  findingIds: readonly string[],
+  aliases?: Readonly<Record<string, string>>,
+): boolean {
+  const key = findingKey(findingIds, aliases)
   return team.tasks.some((item) => (
     taskKindOf(item) === 'repair'
     && item.sourceTaskId === sourceTaskId
-    && findingKey(item.sourceFindingIds ?? []) === key
+    && findingKey(item.sourceFindingIds ?? [], aliases) === key
     && OPEN_FOLLOW_UP_STATUSES.includes(item.status)
   ))
 }
@@ -751,7 +905,21 @@ function withoutScopeConflicts(
   return outOfScope.filter((pattern) => !conflicting.has(pattern))
 }
 
-export function planQualityFollowUp(team: TeamState, closed: TeamTask): PlanQualityFollowUpResult {
+/**
+ * Plan the automatic repair + next-review gate for a failed review.
+ *
+ * Pure and non-blocking by construction: when the caller has semantic
+ * decisions available it passes them as `hints`; when it does not — because
+ * the decision layer is disabled, timed out, abstained, or answered with
+ * something this roster cannot honor — every heuristic below behaves exactly
+ * as it did before hints existed. Hints can therefore only replace a
+ * heuristic that already ran, never remove the fallback.
+ */
+export function planQualityFollowUp(
+  team: TeamState,
+  closed: TeamTask,
+  hints?: JevDecisionHints,
+): PlanQualityFollowUpResult {
   const empty = { created: [] as PlannedFollowUpTask[], tasks: [] as PlannedFollowUpTask[] }
   const kind = taskKindOf(closed)
   if ((kind !== 'review' && kind !== 'requirements') || closed.status !== 'failed') return empty
@@ -782,15 +950,23 @@ export function planQualityFollowUp(team: TeamState, closed: TeamTask): PlanQual
   const source = team.tasks.find((item) => item.id === sourceId)
   const findings = unresolvedFindings(closed)
   const findingIds = findings.map((finding) => finding.id)
-  if (hasOpenFollowUp(team, sourceId, findingIds)) return empty
-  if (countRepairAttempts(team, sourceId, findingIds) >= policy.maxRepairAttempts) {
+  const aliases = hints?.findingAliases
+  if (hasOpenFollowUp(team, sourceId, findingIds, aliases)) return empty
+  if (countRepairAttempts(team, sourceId, findingIds, aliases) >= policy.maxRepairAttempts) {
     return { ...empty, escalated: true, status: 'escalated' }
   }
   // inScope is derived from the findings below: the observed file plus any
-  // workspace-relative paths referenced by the requiredFix instructions.
-
-  const repairScope = repairScopeFromFindings(findings, source?.inScope)
-  const implementer = schedulableAssignee(source?.assignee, team)
+  // workspace-relative paths referenced by the requiredFix instructions. A
+  // decision-layer hint supplements that derivation, and the `replace` policy
+  // lets it take over wholesale; see JevDecisionHints for why union is the
+  // default. An empty hint list always keeps the heuristic.
+  const hintedScope = hints?.repairInScope
+  const repairScope = hintedScope !== undefined && hintedScope.length > 0
+    ? hints?.scopePolicy === 'replace'
+      ? [...new Set(hintedScope)]
+      : [...new Set([...hintedScope, ...(repairScopeFromFindings(findings, undefined) ?? [])])]
+    : repairScopeFromFindings(findings, source?.inScope)
+  const implementer = hintedAssignee(hints?.implementer, source?.assignee, team)
   const repair: PlannedFollowUpTask = {
     id: `repair-round-${nextRound}`,
     kind: 'repair',
@@ -806,7 +982,8 @@ export function planQualityFollowUp(team: TeamState, closed: TeamTask): PlanQual
     sourceTaskId: sourceId,
     sourceFindingIds: findingIds,
   }
-  const reviewer = schedulableAssignee(
+  const reviewer = hintedAssignee(
+    hints?.reviewer,
     closed.assignee !== implementer ? closed.assignee : undefined,
     team,
     implementer,

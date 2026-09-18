@@ -39,6 +39,8 @@ import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { collectArchivedTeamsActivity, collectTeamsActivity } from './snapshot.ts'
 import { findTeamByCaptain } from './state.ts'
+import { createJevDecisions, resolveJevConfig } from './jev.ts'
+import { createLlmTranslator, translationRouteFromTeam } from './jev-translate.ts'
 import { formatProfilesForPrompt, type TeamProfileConfig } from './profiles.ts'
 import { installTeamCapabilities } from './capabilities.ts'
 import { TEAM_TOOL_NAMES } from './tool-names.ts'
@@ -82,6 +84,65 @@ export interface Config {
    * Disable to keep the natural-language trigger as the only entry point.
    */
   slashCommand?: boolean
+  /**
+   * Optional Jev decision layer for the automatic quality-gate loop.
+   *
+   * Disabled by default. When enabled, the three heuristics that plan an
+   * automatic repair round — the derived repair `inScope`, the repair/review
+   * owner, and whether a finding restates an earlier defect — get a semantic
+   * first opinion. Every answer is advisory and fail-open: a timeout, an
+   * abstention, a translation failure, or an answer the roster cannot honor
+   * leaves the original heuristic in charge.
+   *
+   * The API key is read from the environment (`apiKeyEnv`) and is never
+   * written to team state. Reviews whose prose is not English are translated
+   * at the boundary before they are sent, because the model's strongest
+   * language is English; when no translation route resolves, the layer
+   * abstains for that review instead of sending prose it reads poorly.
+   */
+  jev?: {
+    /** Master switch (default `false`). */
+    enabled?: boolean
+    /** System One endpoint (default `https://api.typesafe.ai`). */
+    baseUrl?: string
+    /** Pinned model id (default `jev-latest`). Pin a version before trusting any threshold. */
+    model?: string
+    /** Environment variable holding the API key (default `JEV_API_KEY`). */
+    apiKeyEnv?: string
+    /** End-to-end timeout in milliseconds (default `4000`). */
+    timeoutMs?: number
+    /**
+     * Top-probability floor below which an answer is discarded and the
+     * heuristic runs instead (default `0.6`). This is the published starting
+     * point, not a calibrated value: measure it against your own labelled
+     * decisions before relying on it.
+     */
+    minProbability?: number
+    /** Which decisions may be delegated. Omitted means all three. */
+    decisions?: {
+      repairScope?: boolean
+      routing?: boolean
+      dedup?: boolean
+      /**
+       * How a repair-scope answer combines with the existing derivation
+       * (default `union`). `union` keeps every path the findings observe or
+       * name and lets the decision add to that set; `replace` takes the
+       * answer verbatim, which is tighter but can narrow the scope below what
+       * the acceptance criteria require.
+       */
+      scopePolicy?: 'union' | 'replace'
+    }
+    /**
+     * Explicit route for the boundary translation call. Omitted means the
+     * reviewing member's own captured route is used, which needs no extra
+     * configuration and keeps the translation on a model that is already
+     * provisioned for this team.
+     */
+    translation?: {
+      provider: string
+      model: string
+    }
+  }
 }
 
 // `z.object()` has an implicit `{}` default in Schemastery.  Fallback routes
@@ -132,6 +193,24 @@ export const Config: z<Config> = z.object({
   maxMembers: z.natural().min(1).default(8),
   promptSectionOrder: z.natural().default(117),
   slashCommand: z.boolean().default(true),
+  jev: z.object({
+    enabled: z.boolean().default(false),
+    baseUrl: z.string(),
+    model: z.string(),
+    apiKeyEnv: z.string(),
+    timeoutMs: z.natural().min(1),
+    minProbability: z.number().min(0).max(1),
+    decisions: z.object({
+      repairScope: z.boolean(),
+      routing: z.boolean(),
+      dedup: z.boolean(),
+      scopePolicy: z.union([z.const('union'), z.const('replace')]),
+    }),
+    translation: z.object({
+      provider: z.string().required(),
+      model: z.string().required(),
+    }),
+  }),
 })
 
 /** The model-facing usage policy: when and how to drive AgentTeams. */
@@ -161,6 +240,26 @@ export function apply(ctx: Context, config: Config): void {
     maxMembers: config.maxMembers ?? 8,
     profiles: config.profiles ?? {},
   }
+
+  // Optional semantic layer for the automatic quality-gate loop. The route for
+  // the boundary translation is resolved per decision (the reviewing member's
+  // own captured model needs no extra configuration), and every failure path
+  // inside the layer returns `{}` so the pure heuristics keep running.
+  resolved.jev = createJevDecisions(
+    resolveJevConfig(config.jev),
+    process.env,
+    {
+      translator: (input) => createLlmTranslator(
+        ctx,
+        config.jev?.translation ?? translationRouteFromTeam(
+          input.team.members,
+          [input.closed.assignee],
+        ),
+        (message) => { ctx.logger?.warn?.(message) },
+      ),
+      onDiagnostic: (message) => { ctx.logger?.warn?.(message) },
+    },
+  )
 
   // Provider registration is a sibling plugin's effect (`subagent-spawn` /
   // `subagent-fork` rows), which can land after this mount under the Loader's

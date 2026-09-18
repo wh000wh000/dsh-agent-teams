@@ -80,7 +80,10 @@ export interface JevDecisionConfig {
   keychainAccount: string
   /** End-to-end timeout in milliseconds; expiry is a fail-open. */
   timeoutMs: number
-  /** Top-probability floor below which an answer is discarded. */
+  /**
+   * Global top-probability floor, used by any decision that has no explicit
+   * override of its own.
+   */
   minProbability: number
   /** Individual decisions that may be delegated. */
   decisions: {
@@ -94,6 +97,17 @@ export interface JevDecisionConfig {
      * `JevDecisionHints.scopePolicy`.
      */
     scopePolicy: 'union' | 'replace'
+    /**
+     * Per-decision floors. A threshold is a property of ONE decision and ONE
+     * labelled corpus, so a single global number silently applies a
+     * calibration to decisions it was never measured on. Overrides exist so a
+     * calibration can be introduced where it was actually measured.
+     */
+    minProbability: {
+      repairScope: number
+      routing: number
+      dedup: number
+    }
   }
 }
 
@@ -112,6 +126,11 @@ export interface JevConfigInput {
     routing?: boolean
     dedup?: boolean
     scopePolicy?: 'union' | 'replace'
+    minProbability?: {
+      repairScope?: number
+      routing?: number
+      dedup?: number
+    }
   }
 }
 
@@ -131,6 +150,11 @@ export function resolveJevConfig(input: JevConfigInput | undefined): JevDecision
       routing: input?.decisions?.routing ?? true,
       dedup: input?.decisions?.dedup ?? true,
       scopePolicy: input?.decisions?.scopePolicy ?? 'union',
+      minProbability: {
+        repairScope: input?.decisions?.minProbability?.repairScope ?? input?.minProbability ?? DEFAULT_JEV_MIN_PROBABILITY,
+        routing: input?.decisions?.minProbability?.routing ?? input?.minProbability ?? DEFAULT_JEV_MIN_PROBABILITY,
+        dedup: input?.decisions?.minProbability?.dedup ?? input?.minProbability ?? DEFAULT_JEV_MIN_PROBABILITY,
+      },
     },
   }
 }
@@ -458,7 +482,6 @@ export function hintsFromAnswers(
     roster: readonly string[]
     routingTasks: readonly string[]
     earlierFindingIds: readonly string[]
-    minProbability: number
     decisions: JevDecisionConfig['decisions']
   },
 ): JevDecisionHints {
@@ -469,7 +492,7 @@ export function hintsFromAnswers(
     const scope: string[] = []
     for (const findingId of input.findingIds) {
       for (const path of input.scopeCandidates) {
-        const choice = acceptedChoice(map[`scope::${findingId}::${path}`], ['include', 'exclude', 'unknown'], input.minProbability)
+        const choice = acceptedChoice(map[`scope::${findingId}::${path}`], ['include', 'exclude', 'unknown'], input.decisions.minProbability.repairScope)
         if (choice === 'include' && !scope.includes(path)) scope.push(path)
       }
     }
@@ -481,7 +504,7 @@ export function hintsFromAnswers(
 
   if (input.decisions.routing) {
     for (const taskId of input.routingTasks) {
-      const choice = acceptedChoice(map[`owner::${taskId}`], [...input.roster, 'unknown'], input.minProbability)
+      const choice = acceptedChoice(map[`owner::${taskId}`], [...input.roster, 'unknown'], input.decisions.minProbability.routing)
       if (choice === undefined) continue
       if (taskId === 'repair') hints.implementer = choice
       if (taskId === 'review') hints.reviewer = choice
@@ -498,7 +521,7 @@ export function hintsFromAnswers(
       // repair budget uncounted.
       const confirmed: string[] = []
       for (const earlierId of input.earlierFindingIds) {
-        if (acceptedNoul(map[`dup::${findingId}::${earlierId}`], input.minProbability) !== true) continue
+        if (acceptedNoul(map[`dup::${findingId}::${earlierId}`], input.decisions.minProbability.dedup) !== true) continue
         confirmed.push(earlierId)
       }
       if (confirmed.length > 0) aliases[findingId] = confirmed
@@ -653,6 +676,7 @@ export function createJevDecisions(
   let credentialAttempt: Promise<JevCredential | undefined> | undefined
   let missingReported = false
   let originReported = false
+  let nativeProseReported = false
   const loadCredential = (): Promise<JevCredential | undefined> => {
     credentialAttempt ??= (deps.credential ?? (() => resolveJevCredential({
       apiKeyEnv: config.apiKeyEnv,
@@ -733,23 +757,32 @@ export function createJevDecisions(
         // request carries English prose even when the team's own artifacts are
         // not. The projection is an allowlist (see JEV_PROSE_PATHS), which is
         // why paths, ids and kinds are never rewritten.
+        // Native prose goes to the model as written. A measured comparison on a
+        // real team's findings found Chinese and English score identically on
+        // the dedup decision (4/10 full coverage, 1 miss, 0 false merges under
+        // both), so refusing to send non-English prose bought no accuracy while
+        // it silently disabled the whole layer on Chinese teams. English
+        // remains available as an explicit opt-in for anyone who wants it.
         const prose = collectProseSlots(input, findings, earlier, roster)
-        let resolved: Map<string, string> | undefined
+        let resolved = applyTranslation(prose, new Map())
         if (requiresTranslation(prose)) {
           const translator = translatorFor(deps.translator, input)
           if (translator?.available !== true) {
-            onDiagnostic('agent-teams: Jev decisions skipped because the review carries non-English prose and no translator route resolved')
-            return {}
+            if (!nativeProseReported) {
+              nativeProseReported = true
+              onDiagnostic('agent-teams: sending non-English prose to Jev as written; the model is strongest in English, so calibrate the abstention floor on your own language and data')
+            }
+          } else {
+            const signal = AbortSignal.timeout(config.timeoutMs)
+            const translated = await translator.translate(prose, signal)
+            if (translated === undefined) {
+              // A failed opt-in translation is not a reason to lose the
+              // decision: native prose is already an accepted input.
+              onDiagnostic('agent-teams: boundary translation failed; sending the original prose instead')
+            } else {
+              resolved = applyTranslation(prose, translated)
+            }
           }
-          const signal = AbortSignal.timeout(config.timeoutMs)
-          const translated = await translator.translate(prose, signal)
-          if (translated === undefined) {
-            onDiagnostic('agent-teams: Jev decisions skipped because boundary translation failed; falling back to heuristics')
-            return {}
-          }
-          resolved = applyTranslation(prose, translated)
-        } else {
-          resolved = applyTranslation(prose, new Map())
         }
 
         const state = projectState(input, findings, earlier, roster, scopeCandidates, resolved)
@@ -775,7 +808,6 @@ export function createJevDecisions(
           roster: rosterNames,
           routingTasks: routingTasks.map((task) => task.id),
           earlierFindingIds: earlier.map((finding) => finding.id),
-          minProbability: config.minProbability,
           decisions: config.decisions,
         })
       } catch (error: unknown) {

@@ -178,29 +178,3 @@ export function createLlmTranslator(
     },
   }
 }
-
-/**
- * Choose the translation route from the team's own durable records.
- *
- * The reviewing member's captured route is the natural choice: it is already
- * validated, already paid for, and it is the model that produced the prose
- * being translated. No route is invented and none is silently defaulted,
- * because a translation routed to an unavailable model would turn one
- * abstention into a permanent outage of the decision layer.
- */
-export function translationRouteFromTeam(
-  members: readonly { status?: string, provider?: string, model?: string, activeProvider?: string, activeModel?: string, name: string }[],
-  preferredNames: readonly (string | undefined)[],
-): JevTranslationRoute | undefined {
-  const live = members.filter((member) => member.status !== 'removed')
-  const ordered = [
-    ...live.filter((member) => preferredNames.includes(member.name)),
-    ...live,
-  ]
-  for (const member of ordered) {
-    const provider = (member.activeProvider ?? member.provider ?? '').trim()
-    const model = (member.activeModel ?? member.model ?? '').trim()
-    if (provider !== '' && model !== '') return { provider, model }
-  }
-  return undefined
-}

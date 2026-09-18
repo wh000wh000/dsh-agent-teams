@@ -75,6 +75,21 @@ function failedReview(extra = {}) {
   }
 }
 
+/** Build the decision block `hintsFromAnswers` expects, with optional overrides. */
+function makeDecisions(extra = {}) {
+  const base = { repairScope: true, routing: true, dedup: true, scopePolicy: 'union' }
+  const decisions = { ...base, ...extra }
+  return {
+    ...decisions,
+    minProbability: {
+      repairScope: decisions.repairScope === false ? 1 : 0.6,
+      routing: decisions.routing === false ? 1 : 0.6,
+      dedup: decisions.dedup === false ? 1 : 0.6,
+      ...(extra.minProbability ?? {}),
+    },
+  }
+}
+
 function plannedRepair(result) {
   return result.created.find((task) => task.kind === 'repair')
 }
@@ -284,8 +299,7 @@ test('hints fold only accepted answers', () => {
       roster: ['impl'],
       routingTasks: ['repair'],
       earlierFindingIds: ['F0'],
-      minProbability: 0.6,
-      decisions: { repairScope: true, routing: true, dedup: true, scopePolicy: 'union' },
+      decisions: makeDecisions(),
     },
   )
   assert.deepEqual(hints.repairInScope, ['a.ts'])
@@ -293,13 +307,25 @@ test('hints fold only accepted answers', () => {
   assert.deepEqual(hints.findingAliases, { F1: ['F0'] })
 })
 
-test('a non-English payload with no translator abstains without calling the API', async () => {
+test('non-English prose is sent as written rather than aborting the decision', async () => {
   const diagnostics = []
+  let apiCalls = 0
   const decisions = createJevDecisions(
     resolveJevConfig({ enabled: true, model: 'jev-1.13.0' }),
     { JEV_API_KEY: 'test-key' },
     {
-      fetch: () => { throw new Error('the API must not be called') },
+      fetch: () => {
+        apiCalls += 1
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve({
+            answers: {
+              'scope::F1::a.ts': { type: 'choice', choice: 'include', probabilities: { include: 0.9, exclude: 0.1 } },
+            },
+          }),
+        })
+      },
       onDiagnostic: (message) => diagnostics.push(message),
     },
   )
@@ -308,8 +334,45 @@ test('a non-English payload with no translator abstains without calling the API'
     closed: failedReview({ findings: [finding({ problem: '退款会重复扣款' })] }),
     scopeCandidates: ['a.ts'],
   })
-  assert.deepEqual(hints, {})
-  assert.ok(diagnostics.some((line) => line.includes('non-English prose')), diagnostics.join(' | '))
+  assert.equal(apiCalls, 1, 'the decision must still be asked')
+  assert.deepEqual(hints.repairInScope, ['a.ts'])
+  assert.equal(diagnostics.filter((line) => line.includes('non-English prose')).length, 1, 'reported once')
+})
+
+test('a configured translator is used when the operator opted into English', async () => {
+  const seen = []
+  const decisions = createJevDecisions(
+    resolveJevConfig({ enabled: true, model: 'jev-1.13.0' }),
+    { JEV_API_KEY: 'test-key' },
+    {
+      translator: {
+        available: true,
+        translate: (slots) => {
+          const resolved = new Map()
+          for (const slot of slots) {
+            const key = slot.index === undefined ? slot.path : `${slot.path}#${slot.index}`
+            resolved.set(key, 'english rendering')
+            seen.push(key)
+          }
+          return Promise.resolve(resolved)
+        },
+      },
+      fetch: (_url, init) => {
+        seen.push(JSON.parse(init.body).state.findings[0].problem)
+        return Promise.resolve({
+          ok: true, status: 200,
+          json: () => Promise.resolve({ answers: {} }),
+        })
+      },
+    },
+  )
+  await decisions.decide({
+    team: team(),
+    closed: failedReview({ findings: [finding({ problem: '退款会重复扣款' })] }),
+    scopeCandidates: [],
+  })
+  assert.ok(seen.includes('findings[*].problem#0'), 'the prose slot was offered to the translator')
+  assert.equal(seen.at(-1), 'english rendering', 'the request carried the English rendering')
 })
 
 test('a failed decision call is a fail-open with a diagnostic', async () => {
@@ -369,7 +432,13 @@ test('the default configuration is off', () => {
   const resolved = resolveJevConfig(undefined)
   assert.equal(resolved.enabled, false)
   assert.equal(resolved.minProbability, 0.6)
-  assert.deepEqual(resolved.decisions, { repairScope: true, routing: true, dedup: true, scopePolicy: 'union' })
+  assert.deepEqual(resolved.decisions, {
+    repairScope: true,
+    routing: true,
+    dedup: true,
+    scopePolicy: 'union',
+    minProbability: { repairScope: 0.6, routing: 0.6, dedup: 0.6 },
+  })
 })
 
 // ── boundary translation ────────────────────────────────────────────────────
@@ -649,9 +718,33 @@ test('every confirmed earlier finding is kept, not just the most confident', () 
       roster: [],
       routingTasks: [],
       earlierFindingIds: ['N3', 'N5', 'N6', 'N7'],
-      minProbability: 0.6,
-      decisions: { repairScope: false, routing: false, dedup: true, scopePolicy: 'union' },
+      decisions: makeDecisions({ repairScope: false, routing: false, dedup: true }),
     },
   )
   assert.deepEqual(hints.findingAliases, { T5: ['N3', 'N5', 'N6'] })
+})
+
+
+test('a per-decision floor overrides the global one only for that decision', () => {
+  const resolved = resolveJevConfig({ enabled: true, minProbability: 0.6, decisions: { minProbability: { dedup: 0.45 } } })
+  assert.equal(resolved.decisions.minProbability.dedup, 0.45)
+  assert.equal(resolved.decisions.minProbability.repairScope, 0.6)
+  assert.equal(resolved.decisions.minProbability.routing, 0.6)
+})
+
+test('the calibrated dedup floor keeps a match the global floor would discard', () => {
+  const answers = {
+    'dup::F1::F0': { type: 'noul', noul: 0.56 },
+  }
+  const input = {
+    findingIds: ['F1'],
+    scopeCandidates: [],
+    roster: [],
+    routingTasks: [],
+    earlierFindingIds: ['F0'],
+  }
+  assert.equal(hintsFromAnswers(answers, { ...input, decisions: makeDecisions() }).findingAliases, undefined)
+  const calibrated = makeDecisions()
+  calibrated.minProbability.dedup = 0.45
+  assert.deepEqual(hintsFromAnswers(answers, { ...input, decisions: calibrated }).findingAliases, { F1: ['F0'] })
 })

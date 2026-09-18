@@ -40,7 +40,7 @@ import { fileURLToPath } from 'node:url'
 import { collectArchivedTeamsActivity, collectTeamsActivity } from './snapshot.ts'
 import { findTeamByCaptain } from './state.ts'
 import { createJevDecisions, resolveJevConfig } from './jev.ts'
-import { createLlmTranslator, translationRouteFromTeam } from './jev-translate.ts'
+import { createLlmTranslator } from './jev-translate.ts'
 import { formatProfilesForPrompt, type TeamProfileConfig } from './profiles.ts'
 import { installTeamCapabilities } from './capabilities.ts'
 import { TEAM_TOOL_NAMES } from './tool-names.ts'
@@ -215,6 +215,11 @@ export const Config: z<Config> = z.object({
       routing: z.boolean(),
       dedup: z.boolean(),
       scopePolicy: z.union([z.const('union'), z.const('replace')]),
+      minProbability: z.object({
+        repairScope: z.number().min(0).max(1),
+        routing: z.number().min(0).max(1),
+        dedup: z.number().min(0).max(1),
+      }),
     }),
     // Same Schemastery trap the fallback route documents above: a nested
     // `z.object()` defaults to `{}`, which would then fail on the required
@@ -275,12 +280,14 @@ export function apply(ctx: Context, config: Config): void {
     jevConfig,
     process.env,
     {
-      translator: (input) => createLlmTranslator(
+      // English is OPT-IN. Without an explicit route the request carries the
+      // team's own prose: the model reads CJK competently, and a measured
+      // comparison found no accuracy difference on the dedup decision. The
+      // derived-from-roster route is deliberately no longer automatic, because
+      // it turned "the team writes Chinese" into "the layer never runs".
+      translator: () => createLlmTranslator(
         ctx,
-        config.jev?.translation ?? translationRouteFromTeam(
-          input.team.members,
-          [input.closed.assignee],
-        ),
+        config.jev?.translation,
         (message) => { ctx.logger?.warn?.(message) },
       ),
       onDiagnostic: (message) => { ctx.logger?.warn?.(message) },

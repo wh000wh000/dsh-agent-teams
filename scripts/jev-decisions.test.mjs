@@ -214,7 +214,7 @@ test('an alias onto the earlier finding makes the same defect hit the budget', (
   const planned = planQualityFollowUp(
     state,
     failedReview({ findings: [finding({ id: 'F9' })] }),
-    { findingAliases: { F9: 'F1' } },
+    { findingAliases: { F9: ['F1'] } },
   )
   assert.equal(planned.escalated, true)
   assert.deepEqual(planned.created, [])
@@ -290,7 +290,7 @@ test('hints fold only accepted answers', () => {
   )
   assert.deepEqual(hints.repairInScope, ['a.ts'])
   assert.equal(hints.implementer, 'impl')
-  assert.deepEqual(hints.findingAliases, { F1: 'F0' })
+  assert.deepEqual(hints.findingAliases, { F1: ['F0'] })
 })
 
 test('a non-English payload with no translator abstains without calling the API', async () => {
@@ -588,4 +588,70 @@ test('routing questions carry per-task intent into the instructions', () => {
   assert.match(questions['owner::repair'].instructions, /PREFER_THE_IMPLEMENTER/u)
   assert.match(questions['owner::review'].instructions, /KEEP_REVIEW_INDEPENDENT/u)
   assert.ok(Object.keys(questions['owner::repair'].criteria).includes('unknown'))
+})
+
+
+// ── a merged narrative still counts against the repair budget ───────────────
+
+test('a finding that merges several earlier ones still exhausts their budget', () => {
+  const state = team({
+    reviewPolicy: { maxRepairAttempts: 1, codeMaxRounds: 6 },
+    tasks: [
+      ...team().tasks,
+      {
+        id: 't3', subject: 'repair-round-1', status: 'completed', dependencies: ['t1'],
+        createdAt: 0, updatedAt: 0, attempt: 1, kind: 'repair', round: 1,
+        sourceTaskId: 't1', sourceFindingIds: ['N3', 'N5'],
+      },
+    ],
+  })
+  const merged = failedReview({ findings: [finding({ id: 'T5' })] })
+  // Set-equality alone cannot see this: the incoming key is T5, the recorded
+  // key is N3,N5, so the budget never accumulates.
+  assert.equal(planQualityFollowUp(state, merged).escalated, undefined)
+  const budgeted = planQualityFollowUp(state, merged, { findingAliases: { T5: ['N3', 'N5'] } })
+  assert.equal(budgeted.escalated, true)
+  assert.deepEqual(budgeted.created, [])
+})
+
+test('a merged finding that also carries genuinely new work still opens a repair', () => {
+  const state = team({
+    reviewPolicy: { maxRepairAttempts: 1, codeMaxRounds: 6 },
+    tasks: [
+      ...team().tasks,
+      {
+        id: 't3', subject: 'repair-round-1', status: 'completed', dependencies: ['t1'],
+        createdAt: 0, updatedAt: 0, attempt: 1, kind: 'repair', round: 1,
+        sourceTaskId: 't1', sourceFindingIds: ['N3'],
+      },
+    ],
+  })
+  const planned = planQualityFollowUp(
+    state,
+    failedReview({ findings: [finding({ id: 'T5' }), finding({ id: 'T1' })] }),
+    { findingAliases: { T5: ['N3'] } },
+  )
+  assert.equal(planned.escalated, undefined)
+  assert.ok(planned.created.some((item) => item.kind === 'repair'))
+})
+
+test('every confirmed earlier finding is kept, not just the most confident', () => {
+  const hints = hintsFromAnswers(
+    {
+      'dup::T5::N3': { type: 'noul', noul: 0.91 },
+      'dup::T5::N5': { type: 'noul', noul: 0.88 },
+      'dup::T5::N6': { type: 'noul', noul: 0.72 },
+      'dup::T5::N7': { type: 'noul', noul: 0.55 },
+    },
+    {
+      findingIds: ['T5'],
+      scopeCandidates: [],
+      roster: [],
+      routingTasks: [],
+      earlierFindingIds: ['N3', 'N5', 'N6', 'N7'],
+      minProbability: 0.6,
+      decisions: { repairScope: false, routing: false, dedup: true, scopePolicy: 'union' },
+    },
+  )
+  assert.deepEqual(hints.findingAliases, { T5: ['N3', 'N5', 'N6'] })
 })

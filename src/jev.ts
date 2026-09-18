@@ -489,16 +489,19 @@ export function hintsFromAnswers(
   }
 
   if (input.decisions.dedup) {
-    const aliases: Record<string, string> = {}
+    const aliases: Record<string, string[]> = {}
     for (const findingId of input.findingIds) {
-      let best: { id: string, probability: number } | undefined
+      // Collect EVERY earlier finding the model confirmed, not just the most
+      // confident one. A review may merge several earlier findings into a
+      // single narrative, and keeping only the best match would lose the rest
+      // of the merged set — which is exactly the case that used to leave the
+      // repair budget uncounted.
+      const confirmed: string[] = []
       for (const earlierId of input.earlierFindingIds) {
-        const answer = map[`dup::${findingId}::${earlierId}`]
-        if (acceptedNoul(answer, input.minProbability) !== true) continue
-        const probability = answer?.noul ?? 0
-        if (best === undefined || probability > best.probability) best = { id: earlierId, probability }
+        if (acceptedNoul(map[`dup::${findingId}::${earlierId}`], input.minProbability) !== true) continue
+        confirmed.push(earlierId)
       }
-      if (best !== undefined) aliases[findingId] = best.id
+      if (confirmed.length > 0) aliases[findingId] = confirmed
     }
     if (Object.keys(aliases).length > 0) hints.findingAliases = aliases
   }

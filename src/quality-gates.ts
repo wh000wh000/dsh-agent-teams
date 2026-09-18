@@ -155,13 +155,13 @@ export interface JevDecisionHints {
   /** Member name chosen for the following review task. */
   reviewer?: string
   /**
-   * Canonical finding id per incoming finding id. A finding that semantically
-   * repeats an earlier one maps onto that earlier id, so the repair-attempt
-   * budget is keyed on the DEFECT rather than on the wording a reviewer chose
-   * this round. Without aliases, renaming a finding id resets the counter and
-   * the loop cap can be bypassed.
+   * Canonical finding ids per incoming finding id. A finding that
+   * semantically repeats earlier ones maps onto all of them, so the
+   * repair-attempt budget is keyed on the DEFECT rather than on the wording a
+   * reviewer chose this round. The value is a list because a review can merge
+   * several earlier findings into one narrative.
    */
-  findingAliases?: Record<string, string>
+  findingAliases?: Record<string, readonly string[]>
 }
 
 export interface CoverageRow {
@@ -596,25 +596,78 @@ function unresolvedFindings(task: TeamTask): ReviewFinding[] {
 /**
  * Canonicalize one finding id through the semantic alias table.
  *
- * `findingAliases` maps a finding id onto the id of an earlier finding that
- * reports the SAME underlying defect. Collapsing both ids onto one canonical
- * id is what makes the repair budget survive a reviewer renaming its finding
- * between rounds. Aliases are followed transitively (bounded by the table
- * size) so an incoming id may itself alias an already-aliased id.
+ * `findingAliases` maps a finding id onto the ids of earlier findings that
+ * report the SAME underlying defect. The value is a LIST because a review can
+ * merge several earlier findings into one narrative: on a real team a single
+ * finding restated four earlier ones ("N3, N5, N6 and N7 are all still
+ * unaddressed"). A one-to-one alias cannot express that, and mapping a merged
+ * finding onto only its first member still produced a key that matched
+ * nothing.
+ *
+ * Aliases are followed transitively, bounded so a malformed table cannot loop.
  */
-function canonicalFindingId(id: string, aliases: Readonly<Record<string, string>> | undefined): string {
-  if (aliases === undefined) return id
-  let current = id
-  for (let hop = 0; hop < 8; hop += 1) {
-    const next = aliases[current]
-    if (next === undefined || next === current) return current
-    current = next
+function canonicalFindingIds(id: string, aliases: Readonly<Record<string, readonly string[]>> | undefined): Set<string> {
+  const resolved = new Set<string>()
+  const pending = [id]
+  for (let hop = 0; hop < 32 && pending.length > 0; hop += 1) {
+    const current = pending.pop()
+    if (current === undefined || resolved.has(current)) continue
+    resolved.add(current)
+    const next = aliases?.[current]
+    if (next !== undefined) pending.push(...next)
   }
-  return current
+  return resolved
 }
 
-function findingKey(ids: readonly string[], aliases?: Readonly<Record<string, string>>): string {
-  return [...ids].map((id) => canonicalFindingId(id, aliases)).sort().join(',')
+function findingKey(ids: readonly string[], aliases?: Readonly<Record<string, readonly string[]>>): string {
+  const canonical = new Set<string>()
+  for (const id of ids) {
+    for (const resolved of canonicalFindingIds(id, aliases)) canonical.add(resolved)
+  }
+  return [...canonical].sort().join(',')
+}
+
+/**
+ * Whether every incoming finding has already exhausted the repair budget for
+ * the defect it restates.
+ *
+ * The set-equality key above answers "is this the same group of findings?",
+ * which is a proxy. This answers the actual question — "has every defect in
+ * this batch already been repaired the maximum number of times?" — and it is
+ * the check that survives a reviewer MERGING earlier findings into one
+ * narrative. With the set key alone, a merged finding produces the key
+ * `N3,N5,N6,N7` against a recorded `N1,…,N7`: still unequal, so the budget
+ * never accumulates. Here each incoming finding resolves to its canonical set
+ * and is counted individually, so N3 is recognised as already repaired even
+ * when it arrives as part of a merged narrative.
+ *
+ * Only consulted when aliases exist, so a team without the decision layer
+ * keeps the exact behaviour its tests pin.
+ */
+function repairBudgetExhausted(
+  team: TeamState,
+  sourceTaskId: string,
+  findingIds: readonly string[],
+  aliases: Readonly<Record<string, readonly string[]>>,
+  maxRepairAttempts: number,
+): boolean {
+  if (findingIds.length === 0) return false
+  const repairs = team.tasks.filter((item) => (
+    taskKindOf(item) === 'repair' && item.sourceTaskId === sourceTaskId
+  ))
+  for (const id of findingIds) {
+    const defect = canonicalFindingIds(id, aliases)
+    const attempts = repairs.filter((repair) => {
+      for (const recorded of repair.sourceFindingIds ?? []) {
+        for (const canonical of canonicalFindingIds(recorded, aliases)) {
+          if (defect.has(canonical)) return true
+        }
+      }
+      return false
+    }).length
+    if (attempts < maxRepairAttempts) return false
+  }
+  return true
 }
 
 /**
@@ -870,7 +923,7 @@ function countRepairAttempts(
   team: TeamState,
   sourceTaskId: string,
   findingIds: readonly string[],
-  aliases?: Readonly<Record<string, string>>,
+  aliases?: Readonly<Record<string, readonly string[]>>,
 ): number {
   const key = findingKey(findingIds, aliases)
   return team.tasks.filter((item) => (
@@ -884,7 +937,7 @@ function hasOpenFollowUp(
   team: TeamState,
   sourceTaskId: string,
   findingIds: readonly string[],
-  aliases?: Readonly<Record<string, string>>,
+  aliases?: Readonly<Record<string, readonly string[]>>,
 ): boolean {
   const key = findingKey(findingIds, aliases)
   return team.tasks.some((item) => (
@@ -953,6 +1006,14 @@ export function planQualityFollowUp(
   const aliases = hints?.findingAliases
   if (hasOpenFollowUp(team, sourceId, findingIds, aliases)) return empty
   if (countRepairAttempts(team, sourceId, findingIds, aliases) >= policy.maxRepairAttempts) {
+    return { ...empty, escalated: true, status: 'escalated' }
+  }
+  // A merged narrative escapes the set key above; ask the per-defect question
+  // as well, but only when the decision layer supplied aliases. Without them
+  // every id canonicalises to itself and this reduces to the set key, so
+  // running it unconditionally would only risk changing pinned behaviour.
+  if (aliases !== undefined
+    && repairBudgetExhausted(team, sourceId, findingIds, aliases, policy.maxRepairAttempts)) {
     return { ...empty, escalated: true, status: 'escalated' }
   }
   // inScope is derived from the findings below: the observed file plus any

@@ -345,7 +345,7 @@ export function buildScopeQuestions(
  * schedulable.
  */
 export function buildRoutingQuestions(
-  tasks: readonly { id: string, kind: string, objective: string, forbidden?: string }[],
+  tasks: readonly { id: string, kind: string, objective: string, notes?: string }[],
   roster: readonly { name: string, role?: string, description?: string }[],
 ): Record<string, JevQuestion> {
   const criteria: Record<string, string> = {}
@@ -359,9 +359,8 @@ export function buildRoutingQuestions(
       type: 'choice',
       instructions: [
         `Decide the owner of task ${task.id} (kind=${task.kind}, objective="${task.objective}").`,
-        task.forbidden === undefined ? '' : `Member "${task.forbidden}" must not be chosen for this task.`,
+        task.notes ?? '',
         'Pick the member whose role and description match the actual work.',
-        'Keep review independent of the implementation it judges.',
         'Choose unknown when no member is a real match; abstaining is preferred over assigning work to the wrong role.',
       ].filter((line) => line !== '').join(' '),
       criteria,
@@ -396,12 +395,46 @@ export function buildDedupQuestions(
   return questions
 }
 
-/** Earlier findings worth comparing against: unresolved or already-repaired ones on the same source task. */
-export function earlierFindings(team: TeamState, sourceTaskId: string, incomingIds: readonly string[]): { id: string, problem: string, requiredFix: string }[] {
+/**
+ * Earlier findings worth comparing against when deciding whether a new finding
+ * restates a defect already reported.
+ *
+ * Scope matters more than it looks. A first cut compared against findings on
+ * EVERY task, which on a real team pulled 22 unrelated findings out of two
+ * `work` tasks into the comparison: it diluted the question, and because the
+ * boundary translator has to render every slot it also inflated the request.
+ *
+ * The comparison set is now the closed review's own LINEAGE: walk
+ * `reviewedTaskId` / `sourceTaskId` from the closed task to its root, then
+ * include findings from any task on that chain, plus any task that points at a
+ * chain member. That covers the round-to-round case a repair budget depends on
+ * — review r2 points at the repair, the repair points at the original
+ * implementation, and the r1 review points at that same implementation — while
+ * excluding findings from unrelated work.
+ */
+export function earlierFindings(
+  team: TeamState,
+  closed: { id: string, reviewedTaskId?: string, sourceTaskId?: string },
+  incomingIds: readonly string[],
+): { id: string, problem: string, requiredFix: string }[] {
+  const lineage = new Set<string>()
+  const pending: (string | undefined)[] = [closed.id, closed.reviewedTaskId, closed.sourceTaskId]
+  while (pending.length > 0) {
+    const id = pending.pop()
+    if (id === undefined || id === '' || lineage.has(id)) continue
+    lineage.add(id)
+    const task = team.tasks.find((candidate) => candidate.id === id)
+    if (task === undefined) continue
+    pending.push(task.reviewedTaskId, task.sourceTaskId)
+  }
+
   const seen = new Set<string>()
   const result: { id: string, problem: string, requiredFix: string }[] = []
   for (const task of team.tasks) {
-    if (taskKindIsRepairOrReview(task) && task.sourceTaskId !== undefined && task.sourceTaskId !== sourceTaskId) continue
+    const related = lineage.has(task.id)
+      || (task.reviewedTaskId !== undefined && lineage.has(task.reviewedTaskId))
+      || (task.sourceTaskId !== undefined && lineage.has(task.sourceTaskId))
+    if (!related) continue
     for (const finding of task.findings ?? []) {
       if (incomingIds.includes(finding.id) || seen.has(finding.id)) continue
       seen.add(finding.id)
@@ -409,10 +442,6 @@ export function earlierFindings(team: TeamState, sourceTaskId: string, incomingI
     }
   }
   return result
-}
-
-function taskKindIsRepairOrReview(task: TeamTask): boolean {
-  return task.kind === 'repair' || task.kind === 'review' || task.kind === 'requirements'
 }
 
 /**
@@ -659,11 +688,29 @@ export function createJevDecisions(
           .filter((member) => member.status !== 'removed' && member.name !== 'captain')
           .map((member) => ({ name: member.name, role: member.role, description: member.executionPrompt }))
         const rosterNames = roster.map((member) => member.name)
-        const earlier = earlierFindings(input.team, input.closed.reviewedTaskId ?? input.closed.sourceTaskId ?? '', findingIds)
-        const implementer = input.closed.assignee
+        const earlier = earlierFindings(input.team, input.closed, findingIds)
+        // The two routing questions used to carry these constraints BACKWARDS:
+        // the repair question forbade nothing while the review question forbade
+        // the very reviewer who raised the findings. On a real team that made
+        // the model assign a repair to the independent verifier (whose own
+        // description says it never edits implementation code) and hand the
+        // follow-up review to an auditor instead of the verifier. The intent is
+        // now stated per task, and the only hard guarantee — that the reviewer
+        // is not the repairer — stays enforced by the pure layer, which is the
+        // layer that actually knows the resolved implementer.
         const routingTasks = [
-          { id: 'repair', kind: 'repair', objective: input.closed.objective ?? 'Fix the review findings', forbidden: undefined },
-          { id: 'review', kind: 'review', objective: 'Independently review the repair', forbidden: implementer },
+          {
+            id: 'repair',
+            kind: 'repair',
+            objective: input.closed.objective ?? 'Fix the review findings',
+            notes: 'Prefer the member who implemented the work being repaired, when that member is still on the roster. The member who only verifies or only reviews is a poor owner for a repair, because that role does not edit implementation code.',
+          },
+          {
+            id: 'review',
+            kind: 'review',
+            objective: 'Independently review the repair',
+            notes: 'Choose a member who can judge the repair independently of the person who performed it. Do not choose the member who will be assigned the repair.',
+          },
         ]
 
         const questions: Record<string, JevQuestion> = {

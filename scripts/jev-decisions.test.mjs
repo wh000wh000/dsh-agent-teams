@@ -23,6 +23,8 @@ import {
 import {
   acceptedChoice,
   acceptedNoul,
+  buildRoutingQuestions,
+  earlierFindings,
   applyTranslation,
   createJevDecisions,
   hintsFromAnswers,
@@ -523,4 +525,67 @@ test('an explicit translation route parses without requiring the rest', () => {
   })
   assert.equal(parsed.jev.translation.model, 'claude-sonnet-4-5')
   assert.equal(resolveJevConfig(parsed.jev).enabled, true)
+})
+
+
+// ── the dedup comparison set is the review's own lineage ────────────────────
+//
+// The first cut compared against findings on EVERY task. On a real team that
+// pulled 22 unrelated findings out of two `work` tasks into the comparison:
+// it diluted the question and, because the boundary translator renders every
+// slot, it inflated the request until the layer abstained outright.
+
+function lineageTeam(tasks) {
+  return { ...team(), tasks }
+}
+
+test('unrelated work-task findings stay out of the comparison set', () => {
+  const state = lineageTeam([
+    { id: 't1', kind: 'implementation', status: 'completed', dependencies: [], createdAt: 0, updatedAt: 0, attempt: 1, assignee: 'impl' },
+    { id: 't9', kind: 'work', status: 'completed', dependencies: [], createdAt: 0, updatedAt: 0, attempt: 1, assignee: 'docs',
+      findings: [{ id: 'X1', severity: 'low', problem: 'unrelated', requiredFix: 'unrelated' }] },
+    { id: 't11', kind: 'review', status: 'failed', dependencies: [], createdAt: 0, updatedAt: 0, attempt: 1, assignee: 'rev', round: 1, reviewedTaskId: 't1', verdict: 'needs_revision',
+      findings: [{ id: 'N1', severity: 'high', problem: 'p', requiredFix: 'f' }] },
+    { id: 't12', kind: 'repair', status: 'completed', dependencies: ['t1'], createdAt: 0, updatedAt: 0, attempt: 1, assignee: 'impl', sourceTaskId: 't1',
+      findings: [{ id: 'N2', severity: 'low', problem: 'p2', requiredFix: 'f2' }] },
+  ])
+  const closed = state.tasks.find((t) => t.id === 't11')
+  assert.deepEqual(earlierFindings(state, closed, ['N1']).map((f) => f.id), ['N2'])
+})
+
+test('a round-2 review still reaches the round-1 findings through the repair', () => {
+  const state = lineageTeam([
+    { id: 't1', kind: 'implementation', status: 'completed', dependencies: [], createdAt: 0, updatedAt: 0, attempt: 1, assignee: 'impl' },
+    { id: 't11', kind: 'review', status: 'failed', dependencies: [], createdAt: 0, updatedAt: 0, attempt: 1, assignee: 'rev', round: 1, reviewedTaskId: 't1', verdict: 'needs_revision',
+      findings: [{ id: 'N1', severity: 'high', problem: 'p', requiredFix: 'f' }] },
+    { id: 't12', kind: 'repair', status: 'completed', dependencies: ['t1'], createdAt: 0, updatedAt: 0, attempt: 1, assignee: 'impl', sourceTaskId: 't1' },
+    { id: 't13', kind: 'review', status: 'failed', dependencies: ['t12'], createdAt: 0, updatedAt: 0, attempt: 1, assignee: 'rev', round: 2, reviewedTaskId: 't12', verdict: 'needs_revision',
+      findings: [{ id: 'R1', severity: 'medium', problem: 'r', requiredFix: 'rf' }] },
+  ])
+  const closed = state.tasks.find((t) => t.id === 't13')
+  assert.deepEqual(earlierFindings(state, closed, ['R1']).map((f) => f.id), ['N1'])
+})
+
+test('incoming ids never echo back as earlier findings', () => {
+  const state = lineageTeam([
+    { id: 't11', kind: 'review', status: 'failed', dependencies: [], createdAt: 0, updatedAt: 0, attempt: 1, assignee: 'rev', round: 1, reviewedTaskId: 't1', verdict: 'needs_revision',
+      findings: [{ id: 'N1', severity: 'high', problem: 'p', requiredFix: 'f' }] },
+  ])
+  const closed = state.tasks.find((t) => t.id === 't11')
+  assert.deepEqual(earlierFindings(state, closed, ['N1']), [])
+})
+
+// ── routing questions state the intent, not a backwards constraint ──────────
+
+test('routing questions carry per-task intent into the instructions', () => {
+  const questions = buildRoutingQuestions(
+    [
+      { id: 'repair', kind: 'repair', objective: 'fix it', notes: 'PREFER_THE_IMPLEMENTER' },
+      { id: 'review', kind: 'review', objective: 'review it', notes: 'KEEP_REVIEW_INDEPENDENT' },
+    ],
+    [{ name: 'impl', role: 'engineer' }, { name: 'rev', role: 'reviewer' }],
+  )
+  assert.match(questions['owner::repair'].instructions, /PREFER_THE_IMPLEMENTER/u)
+  assert.match(questions['owner::review'].instructions, /KEEP_REVIEW_INDEPENDENT/u)
+  assert.ok(Object.keys(questions['owner::repair'].criteria).includes('unknown'))
 })

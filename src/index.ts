@@ -259,8 +259,20 @@ export function apply(ctx: Context, config: Config): void {
   // the boundary translation is resolved per decision (the reviewing member's
   // own captured model needs no extra configuration), and every failure path
   // inside the layer returns `{}` so the pure heuristics keep running.
+  const jevConfig = resolveJevConfig(config.jev)
+  if (jevConfig.enabled) {
+    // One line at mount, because the layer is otherwise invisible: without it
+    // an operator cannot tell from the log whether a pinned model, an
+    // abstention floor, or a scope policy is actually live. It names the
+    // credential LOCATION so a missing key is diagnosable, and never the key.
+    ctx.logger?.info?.(
+      `agent-teams: Jev decision layer enabled (model=${jevConfig.model}, `
+      + `minProbability=${String(jevConfig.minProbability)}, scopePolicy=${jevConfig.decisions.scopePolicy}, `
+      + `credential=${jevConfig.apiKeyEnv} or keychain ${jevConfig.keychainService}/${jevConfig.keychainAccount})`,
+    )
+  }
   resolved.jev = createJevDecisions(
-    resolveJevConfig(config.jev),
+    jevConfig,
     process.env,
     {
       translator: (input) => createLlmTranslator(
